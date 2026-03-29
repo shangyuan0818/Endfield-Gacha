@@ -26,3 +26,7 @@ Go to Compile.txt, copy the command and paste into "x64 Native Tools Command Pro
 
 Press enter to run the command
 按下回车来运行命令
+
+# Compatibility 兼容性:
+System 系统: Windows 10 or higher 视窗10或更高
+CPU 处理器: x64 (amd64) 64位
