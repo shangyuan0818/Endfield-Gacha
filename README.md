@@ -1,10 +1,10 @@
-# Endfield-Gacha
+# Endfield-Gacha 终末地抽卡数据保存，数据分析与可视化工具
 Gacha tracker and visualizer for Arknights: Endfield. Built with C++20 &amp; Win32 API.
 《明日方舟：终末地》寻访(抽卡)数据保存，分析与可视化。使用C++20与Win32 API高效处理数据。
 
 
 
-# How to use
+# How to use 如何使用
 Run main.exe (the exporter) and input your gacha link.
 运行用于保存抽卡数据的main.exe主程序并输入你的抽卡链接。
 
