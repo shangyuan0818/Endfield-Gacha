@@ -37,7 +37,12 @@ Press enter to run the command
 
 
 
-# Compatibility 兼容性:
+# Compatibility 兼容性
 System 系统: Windows 10 or higher 视窗10或更高
 
 CPU 处理器: x64 (amd64) 64位
+
+
+
+# Demostrate 效果展示
+<img width="1253" height="1309" alt="image" src="https://github.com/user-attachments/assets/4d8cf8e2-3b41-4b84-a0a7-4de9a981fb4f" />
