@@ -3,22 +3,72 @@
 #include <gdiplus.h>
 #include <string>
 #include <vector>
-#include <unordered_set> // 优化1：替换 set，使用 O(1) 哈希表
-#include <unordered_map> // 优化2：替换 map，使用 O(1) 哈希表
-#include <fstream>
-#include <sstream>
-#include <iomanip>
+#include <unordered_set>
+#include <unordered_map>
 #include <numeric>
 #include <cmath>
 #include <algorithm>
 #include <cctype>
+#include <cstdio> // 引入 sprintf 系列替代 sstream
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "comctl32.lib")
 
 //#include <nlohmann/json.hpp>
-#include "json.hpp"
-using json = nlohmann::json;
+
+// ---------------------------------------------------------
+// [极简 JSON 模块] - 替代 nlohmann::json，追求极致的小体积
+// ---------------------------------------------------------
+std::string ExtractJsonValue(const std::string& source, const std::string& key, bool isString) {
+    std::string searchKey = "\"" + key + "\"";
+    auto pos = source.find(searchKey);
+    if (pos == std::string::npos) return "";
+    pos = source.find(':', pos + searchKey.length());
+    if (pos == std::string::npos) return "";
+    pos++; 
+    while (pos < source.length() && (source[pos] == ' ' || source[pos] == '\t' || source[pos] == '\n' || source[pos] == '\r')) pos++;
+    
+    if (isString) {
+        if (source[pos] != '"') return "";
+        pos++; 
+        auto endPos = pos;
+        while (endPos < source.length() && source[endPos] != '"') {
+            if (source[endPos] == '\\') endPos++; 
+            endPos++;
+        }
+        if (endPos >= source.length()) return "";
+        return source.substr(pos, endPos - pos);
+    } else {
+        auto endPos = pos;
+        while (endPos < source.length() && source[endPos] != ',' && source[endPos] != '}' && source[endPos] != ' ' && source[endPos] != '\n' && source[endPos] != '\r') endPos++;
+        return source.substr(pos, endPos - pos);
+    }
+}
+
+std::vector<std::string> ExtractJsonObjects(const std::string& source, const std::string& arrayKey) {
+    std::vector<std::string> results;
+    std::string searchKey = "\"" + arrayKey + "\"";
+    auto pos = source.find(searchKey);
+    if (pos == std::string::npos) return results;
+    pos = source.find(':', pos + searchKey.length());
+    if (pos == std::string::npos) return results;
+    pos = source.find('[', pos);
+    if (pos == std::string::npos) return results;
+    
+    int depth = 0;
+    size_t objStart = 0;
+    for (size_t i = pos; i < source.length(); ++i) {
+        if (source[i] == '{') {
+            if (depth == 0) objStart = i;
+            depth++;
+        } else if (source[i] == '}') {
+            depth--;
+            if (depth == 0) results.push_back(source.substr(objStart, i - objStart + 1));
+        } else if (source[i] == ']' && depth == 0) break;
+    }
+    return results;
+}
+// ---------------------------------------------------------
 
 // 全局 DPI 缩放变量与辅助函数
 int g_dpi = 96;
@@ -41,13 +91,12 @@ struct Pull {
 struct Stats {
     std::vector<int> all_pities, up_pities, up_win_pities;  
     double avg_all = 0.0, avg_up = 0.0, avg_win = -1.0; 
-    std::unordered_map<int, int> freq_all, freq_up; // 性能提升：替换为 unordered_map
+    std::unordered_map<int, int> freq_all, freq_up;
 };
 
 Stats statsChar, statsWep;
 HWND hOutEdit, hCharEdit, hWepEdit;
 
-// 性能提升：返回 unordered_set
 std::unordered_set<std::wstring> ParseCommaSeparated(const std::wstring& text) {
     std::unordered_set<std::wstring> result;
     std::wstring cur;
@@ -71,7 +120,6 @@ std::unordered_set<std::wstring> ParseCommaSeparated(const std::wstring& text) {
     return result;
 }
 
-// 接收 unordered_set 作为参数
 Stats Calculate(const std::vector<Pull>& pulls, bool isWeapon, const std::unordered_set<std::wstring>& standard_names) {
     Stats s;
     int current_pity = 0, pity_since_last_up = 0;
@@ -80,7 +128,6 @@ Stats Calculate(const std::vector<Pull>& pulls, bool isWeapon, const std::unorde
     for (const auto& p : pulls) {
         bool isSpecial = false;
         
-        // 优化3：热点循环内不再分配字符串，直接使用已在解析阶段转好的小写类型
         if (isWeapon) {
             if (p.item_type != L"Weapon") continue;
             if (p.uigf_gacha_type.find(L"constant") == std::wstring::npos && 
@@ -104,7 +151,6 @@ Stats Calculate(const std::vector<Pull>& pulls, bool isWeapon, const std::unorde
             s.all_pities.push_back(current_pity);
             s.freq_all[current_pity]++;
             
-            // O(1) 极速查找
             bool isUP = !standard_names.contains(p.name);
             
             if (isUP) {
@@ -134,32 +180,43 @@ void ProcessFile(const std::wstring& path) {
     wchar_t wepBuf[4096]; GetWindowTextW(hWepEdit, wepBuf, 4096);
     std::unordered_set<std::wstring> stdWeps = ParseCommaSeparated(wepBuf);
 
-    std::ifstream ifs(path);
-    if (!ifs.is_open()) return;
+    // 【替换 std::ifstream】：使用 Win32 API 极速读文件
+    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    DWORD fileSize = GetFileSize(hFile, NULL);
+    if (fileSize == INVALID_FILE_SIZE || fileSize == 0) { CloseHandle(hFile); return; }
+    
+    std::string buffer(fileSize, '\0');
+    DWORD bytesRead;
+    if (!ReadFile(hFile, &buffer[0], fileSize, &bytesRead, NULL) || bytesRead != fileSize) {
+        CloseHandle(hFile); return;
+    }
+    CloseHandle(hFile);
     
     std::vector<Pull> pulls;
-    try {
-        json j; ifs >> j;
-        for (auto& item : j["list"]) {
-            Pull p;
-            p.name = Utf8ToWstring(item.value("name", ""));
-            p.item_type = Utf8ToWstring(item.value("item_type", ""));
-            p.rank_type = Utf8ToWstring(item.value("rank_type", ""));
-            
-            // 优化3源头：在只执行一次的解析阶段，一次性将 gacha_type 转为小写并存入结构体
-            std::wstring raw_type = Utf8ToWstring(item.value("uigf_gacha_type", ""));
-            std::transform(raw_type.begin(), raw_type.end(), raw_type.begin(), ::towlower);
-            p.uigf_gacha_type = raw_type;
-            
-            if (item.contains("id")) {
-                if (item["id"].is_string()) p.id = std::stoll(item["id"].get<std::string>());
-                else if (item["id"].is_number()) p.id = item["id"].get<long long>();
-            } else p.id = 0;
-            pulls.push_back(p);
-        }
-    } catch (...) { 
-        SetWindowTextW(hOutEdit, L"JSON 解析失败，请检查文件格式。"); 
+    std::vector<std::string> localItems = ExtractJsonObjects(buffer, "list");
+    
+    if (localItems.empty()) {
+        SetWindowTextW(hOutEdit, L"JSON 解析失败或无数据，请检查文件格式。"); 
         return; 
+    }
+
+    for (const auto& itemStr : localItems) {
+        Pull p;
+        p.name = Utf8ToWstring(ExtractJsonValue(itemStr, "name", true));
+        p.item_type = Utf8ToWstring(ExtractJsonValue(itemStr, "item_type", true));
+        p.rank_type = Utf8ToWstring(ExtractJsonValue(itemStr, "rank_type", true));
+        
+        std::wstring raw_type = Utf8ToWstring(ExtractJsonValue(itemStr, "uigf_gacha_type", true));
+        std::transform(raw_type.begin(), raw_type.end(), raw_type.begin(), ::towlower);
+        p.uigf_gacha_type = raw_type;
+        
+        // ID 可能是字符串或数字，先试字符串再试数字，并用 strtoll 避免异常开销
+        std::string idStr = ExtractJsonValue(itemStr, "id", true);
+        if (idStr.empty()) idStr = ExtractJsonValue(itemStr, "id", false);
+        p.id = idStr.empty() ? 0 : std::strtoll(idStr.c_str(), nullptr, 10);
+        
+        pulls.push_back(p);
     }
     
     std::ranges::sort(pulls, [](const Pull& a, const Pull& b){ return std::abs(a.id) < std::abs(b.id); });
@@ -167,24 +224,30 @@ void ProcessFile(const std::wstring& path) {
     statsChar = Calculate(pulls, false, stdChars);
     statsWep = Calculate(pulls, true, stdWeps);
     
-    std::wstringstream wss; wss << std::fixed << std::setprecision(2);
+    // 【替换 std::wstringstream】：使用高性能的 swprintf 格式化
+    wchar_t winCharStr[64] = L"[无数据]";
+    if (statsChar.avg_win >= 0) swprintf(winCharStr, 64, L"%.2f 抽", statsChar.avg_win);
     
-    wss << L"【角色卡池 (特许寻访)】总计六星: " << statsChar.all_pities.size() << L" | 出当期 UP: " << statsChar.up_pities.size() << L"\r\n";
-    wss << L" ▶ 综合六星 (含歪) 出货平均期望: \t" << statsChar.avg_all << L" 抽\r\n";
-    wss << L" ▶ 抽到当期限定 UP 的综合平均期望: \t" << statsChar.avg_up << L" 抽\r\n";
-    if (statsChar.avg_win >= 0) wss << L" ▶ 赢下小保底 (不歪) 的出货期望: \t\t" << statsChar.avg_win << L" 抽\r\n\r\n";
-    else wss << L" ▶ 赢下小保底 (不歪) 的出货期望: \t\t" << L"[无数据]" << L"\r\n\r\n";
+    wchar_t winWepStr[64] = L"[无数据]";
+    if (statsWep.avg_win >= 0) swprintf(winWepStr, 64, L"%.2f 抽", statsWep.avg_win);
+
+    wchar_t outMsg[2048];
+    swprintf(outMsg, 2048, 
+        L"【角色卡池 (特许寻访)】总计六星: %zu | 出当期 UP: %zu\r\n"
+        L" ▶ 综合六星 (含歪) 出货平均期望: \t%.2f 抽\r\n"
+        L" ▶ 抽到当期限定 UP 的综合平均期望: \t%.2f 抽\r\n"
+        L" ▶ 赢下小保底 (不歪) 的出货期望: \t\t%ls\r\n\r\n"
+        L"【武器卡池 (特许武器)】总计六星: %zu | 出当期 UP: %zu\r\n"
+        L" ▶ 综合六星 (含歪) 出货平均期望: \t%.2f 抽\r\n"
+        L" ▶ 抽到当期限定 UP 的综合平均期望: \t%.2f 抽\r\n"
+        L" ▶ 赢下小保底 (不歪) 的出货期望: \t\t%ls",
+        statsChar.all_pities.size(), statsChar.up_pities.size(), statsChar.avg_all, statsChar.avg_up, winCharStr,
+        statsWep.all_pities.size(), statsWep.up_pities.size(), statsWep.avg_all, statsWep.avg_up, winWepStr
+    );
     
-    wss << L"【武器卡池 (特许武器)】总计六星: " << statsWep.all_pities.size() << L" | 出当期 UP: " << statsWep.up_pities.size() << L"\r\n";
-    wss << L" ▶ 综合六星 (含歪) 出货平均期望: \t" << statsWep.avg_all << L" 抽\r\n";
-    wss << L" ▶ 抽到当期限定 UP 的综合平均期望: \t" << statsWep.avg_up << L" 抽\r\n";
-    if (statsWep.avg_win >= 0) wss << L" ▶ 赢下小保底 (不歪) 的出货期望: \t\t" << statsWep.avg_win << L" 抽\r\n";
-    else wss << L" ▶ 赢下小保底 (不歪) 的出货期望: \t\t" << L"[无数据]";
-    
-    SetWindowTextW(hOutEdit, wss.str().c_str());
+    SetWindowTextW(hOutEdit, outMsg);
 }
 
-// 修改参数类型为 const std::unordered_map
 void DrawKDE(Gdiplus::Graphics& g, Gdiplus::Rect rect, const std::unordered_map<int, int>& freq_all, const std::unordered_map<int, int>& freq_up, const std::wstring& title, int limit_base) {
     Gdiplus::SolidBrush bgBrush(Gdiplus::Color(255, 252, 253, 255));
     g.FillRectangle(&bgBrush, rect);
@@ -206,7 +269,6 @@ void DrawKDE(Gdiplus::Graphics& g, Gdiplus::Rect rect, const std::unordered_map<
     max_x = ((max_x / 10) + 1) * 10;
 
     double bandwidth = 4.0; 
-    // Lambda 函数参数同步更新
     auto calcKDE = [&](const std::unordered_map<int, int>& freqs) {
         std::vector<double> curve(max_x + 1, 0.0);
         int total = 0; for (auto const& [v, c] : freqs) total += c;
@@ -258,12 +320,12 @@ void DrawKDE(Gdiplus::Graphics& g, Gdiplus::Rect rect, const std::unordered_map<
         if (i > 0) g.DrawLine(&gridPen, plotX, py, plotX + plotW, py);
         g.DrawLine(&axisPen, plotX - DPIScaleF(5.0f), py, plotX, py);
         
-        std::wstringstream ywss;
-        ywss << std::fixed << std::setprecision(1) << (val * 100.0) << L"%";
-        std::wstring y_label = ywss.str();
+        // 【替换 std::wstringstream】：使用 swprintf
+        wchar_t y_label[32];
+        swprintf(y_label, 32, L"%.1f%%", val * 100.0);
         
-        float textOffset = y_label.length() * DPIScaleF(5.5f); 
-        g.DrawString(y_label.c_str(), -1, &tickFont, Gdiplus::PointF(plotX - textOffset - DPIScaleF(8.0f), py - DPIScaleF(6.0f)), &tickBrush);
+        float textOffset = wcslen(y_label) * DPIScaleF(5.5f); 
+        g.DrawString(y_label, -1, &tickFont, Gdiplus::PointF(plotX - textOffset - DPIScaleF(8.0f), py - DPIScaleF(6.0f)), &tickBrush);
     }
 
     int step = (max_x > 140) ? 20 : 10;
@@ -271,9 +333,11 @@ void DrawKDE(Gdiplus::Graphics& g, Gdiplus::Rect rect, const std::unordered_map<
         float px = plotX + (float)x / (float)max_x * plotW;
         g.DrawLine(&axisPen, px, plotY + plotH, px, plotY + plotH + DPIScaleF(5.0f));
         
-        std::wstring x_label = std::to_wstring(x);
+        // 【替换 std::to_wstring】：使用 swprintf
+        wchar_t x_label[16];
+        swprintf(x_label, 16, L"%d", x);
         float textOffset = (x < 10) ? DPIScaleF(4.0f) : ((x < 100) ? DPIScaleF(8.0f) : DPIScaleF(12.0f));
-        g.DrawString(x_label.c_str(), -1, &tickFont, Gdiplus::PointF(px - textOffset, plotY + plotH + DPIScaleF(8.0f)), &tickBrush);
+        g.DrawString(x_label, -1, &tickFont, Gdiplus::PointF(px - textOffset, plotY + plotH + DPIScaleF(8.0f)), &tickBrush);
     }
 
     if (!freq_all.empty()) {
