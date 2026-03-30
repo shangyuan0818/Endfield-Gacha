@@ -2,36 +2,51 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
-#include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <ctime>
 #include <windows.h>
 #include <winhttp.h>
+#include <string_view>
+#include <charconv>
+#include <ranges>
 
 #pragma comment(lib, "winhttp.lib")
 
-//#include <nlohmann/json.hpp>
+// ---------------------------------------------------------
+// [极简 JSON 解析模块 - 零分配纯净版]
+// ---------------------------------------------------------
+size_t FindJsonKey(std::string_view source, std::string_view key, size_t startPos = 0) {
+    while (true) {
+        size_t pos = source.find(key, startPos);
+        if (pos == std::string_view::npos) return std::string_view::npos;
+        if (pos > 0 && source[pos - 1] == '"' && 
+            (pos + key.length() < source.length()) && source[pos + key.length()] == '"') {
+            return pos - 1; 
+        }
+        startPos = pos + key.length();
+    }
+}
 
-// --- 极简 JSON 解析模块保持不变 ---
-std::string ExtractJsonValue(const std::string& source, const std::string& key, bool isString) {
-    std::string searchKey = "\"" + key + "\"";
-    auto pos = source.find(searchKey);
-    if (pos == std::string::npos) return "";
-    pos = source.find(':', pos + searchKey.length());
-    if (pos == std::string::npos) return "";
+std::string_view ExtractJsonValue(std::string_view source, std::string_view key, bool isString) {
+    size_t pos = FindJsonKey(source, key);
+    if (pos == std::string_view::npos) return {};
+    
+    pos = source.find(':', pos + key.length() + 2);
+    if (pos == std::string_view::npos) return {};
     pos++; 
+    
     while (pos < source.length() && (source[pos] == ' ' || source[pos] == '\t' || source[pos] == '\n' || source[pos] == '\r')) pos++;
     
     if (isString) {
-        if (source[pos] != '"') return "";
+        if (source[pos] != '"') return {};
         pos++; 
         auto endPos = pos;
         while (endPos < source.length() && source[endPos] != '"') {
             if (source[endPos] == '\\') endPos++; 
             endPos++;
         }
-        if (endPos >= source.length()) return "";
-        return source.substr(pos, endPos - pos);
+        return (endPos < source.length()) ? source.substr(pos, endPos - pos) : std::string_view{};
     } else {
         auto endPos = pos;
         while (endPos < source.length() && source[endPos] != ',' && source[endPos] != '}' && source[endPos] != ' ' && source[endPos] != '\n' && source[endPos] != '\r') endPos++;
@@ -39,15 +54,15 @@ std::string ExtractJsonValue(const std::string& source, const std::string& key, 
     }
 }
 
-std::vector<std::string> ExtractJsonObjects(const std::string& source, const std::string& arrayKey) {
-    std::vector<std::string> results;
-    std::string searchKey = "\"" + arrayKey + "\"";
-    auto pos = source.find(searchKey);
-    if (pos == std::string::npos) return results;
-    pos = source.find(':', pos + searchKey.length());
-    if (pos == std::string::npos) return results;
+template<typename Callback>
+void ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callback&& cb) {
+    size_t pos = FindJsonKey(source, arrayKey);
+    if (pos == std::string_view::npos) return;
+    
+    pos = source.find(':', pos + arrayKey.length() + 2);
+    if (pos == std::string_view::npos) return;
     pos = source.find('[', pos);
-    if (pos == std::string::npos) return results;
+    if (pos == std::string_view::npos) return;
     
     int depth = 0;
     size_t objStart = 0;
@@ -57,14 +72,14 @@ std::vector<std::string> ExtractJsonObjects(const std::string& source, const std
             depth++;
         } else if (source[i] == '}') {
             depth--;
-            if (depth == 0) results.push_back(source.substr(objStart, i - objStart + 1));
+            if (depth == 0) cb(source.substr(objStart, i - objStart + 1));
         } else if (source[i] == ']' && depth == 0) break;
     }
-    return results;
 }
 
-std::string EscapeJsonStr(const std::string& s) {
+std::string EscapeJsonStr(std::string_view s) {
     std::string res;
+    res.reserve(s.size() + 10);
     for (char c : s) {
         if (c == '"') res += "\\\"";
         else if (c == '\\') res += "\\\\";
@@ -74,7 +89,7 @@ std::string EscapeJsonStr(const std::string& s) {
 }
 // ---------------------------------------------------------
 
-std::wstring Utf8ToWstring(const std::string& str) {
+std::wstring Utf8ToWstring(std::string_view str) {
     if (str.empty()) return std::wstring();
     int size = MultiByteToWideChar(CP_UTF8, 0, str.data(), (int)str.size(), nullptr, 0);
     std::wstring result(size, 0);
@@ -150,7 +165,7 @@ int main() {
     if (!fgets(urlBuffer, sizeof(urlBuffer), stdin)) return 1;
     
     std::string inputUrl(urlBuffer);
-    inputUrl.erase(inputUrl.find_last_not_of(" \n\r\t") + 1); // Trim newline
+    inputUrl.erase(inputUrl.find_last_not_of(" \n\r\t") + 1);
 
     std::string token = ExtractToken(inputUrl);
     if (token.empty()) {
@@ -168,41 +183,56 @@ int main() {
     };
     
     std::string uigfFilename = "uigf_endfield.json";
-    std::unordered_map<long long, UIGFItem> localRecordsDict;
-    std::unordered_map<long long, UIGFItem> sessionRecordsDict;
-
+    
+    // 摒弃 unordered_map，使用 vector 存储，并在查重时使用二分查找
+    std::vector<UIGFItem> allRecords;
+    std::vector<long long> localIds; 
+    
     HANDLE hFile = CreateFileA(uigfFilename.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile != INVALID_HANDLE_VALUE) {
         DWORD fileSize = GetFileSize(hFile, NULL);
         if (fileSize != INVALID_FILE_SIZE && fileSize > 0) {
-            std::string buffer(fileSize, '\0');
-            DWORD bytesRead;
-            if (ReadFile(hFile, &buffer[0], fileSize, &bytesRead, NULL) && bytesRead == fileSize) {
-                std::vector<std::string> localItems = ExtractJsonObjects(buffer, "list");
-                for (const auto& itemStr : localItems) {
-                    UIGFItem uItem;
-                    uItem.uigf_gacha_type = ExtractJsonValue(itemStr, "uigf_gacha_type", true);
-                    uItem.id = ExtractJsonValue(itemStr, "id", true);
-                    uItem.item_id = ExtractJsonValue(itemStr, "item_id", true);
-                    uItem.name = ExtractJsonValue(itemStr, "name", true);
-                    uItem.item_type = ExtractJsonValue(itemStr, "item_type", true);
-                    uItem.rank_type = ExtractJsonValue(itemStr, "rank_type", true);
-                    uItem.time = ExtractJsonValue(itemStr, "time", true);
-                    uItem.gachaTs = ExtractJsonValue(itemStr, "gachaTs", true);
-                    uItem.poolName = ExtractJsonValue(itemStr, "poolName", true);
-                    uItem.weaponType = ExtractJsonValue(itemStr, "weaponType", true);
-                    uItem.isNew = (ExtractJsonValue(itemStr, "isNew", false) == "true");
-                    uItem.isFree = (ExtractJsonValue(itemStr, "isFree", false) == "true");
+            HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+            if (hMap) {
+                const char* mapData = (const char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+                if (mapData) {
+                    std::string_view bufferView(mapData, fileSize);
                     
-                    // 用 strtoll 替代 std::stoll 避免异常开销
-                    uItem.parsed_id = uItem.id.empty() ? 0 : std::strtoll(uItem.id.c_str(), nullptr, 10);
-                    uItem.parsed_ts = uItem.gachaTs.empty() ? 0 : std::strtoll(uItem.gachaTs.c_str(), nullptr, 10);
-                    localRecordsDict[uItem.parsed_id] = uItem;
+                    ForEachJsonObject(bufferView, "list", [&](std::string_view itemStr) {
+                        UIGFItem uItem;
+                        uItem.uigf_gacha_type = ExtractJsonValue(itemStr, "uigf_gacha_type", true);
+                        uItem.id = ExtractJsonValue(itemStr, "id", true);
+                        uItem.item_id = ExtractJsonValue(itemStr, "item_id", true);
+                        uItem.name = ExtractJsonValue(itemStr, "name", true);
+                        uItem.item_type = ExtractJsonValue(itemStr, "item_type", true);
+                        uItem.rank_type = ExtractJsonValue(itemStr, "rank_type", true);
+                        uItem.time = ExtractJsonValue(itemStr, "time", true);
+                        uItem.gachaTs = ExtractJsonValue(itemStr, "gachaTs", true);
+                        uItem.poolName = ExtractJsonValue(itemStr, "poolName", true);
+                        uItem.weaponType = ExtractJsonValue(itemStr, "weaponType", true);
+                        
+                        std::string_view isNewStr = ExtractJsonValue(itemStr, "isNew", false);
+                        uItem.isNew = (isNewStr == "true");
+                        
+                        std::string_view isFreeStr = ExtractJsonValue(itemStr, "isFree", false);
+                        uItem.isFree = (isFreeStr == "true");
+                        
+                        if (!uItem.id.empty()) std::from_chars(uItem.id.data(), uItem.id.data() + uItem.id.size(), uItem.parsed_id);
+                        if (!uItem.gachaTs.empty()) std::from_chars(uItem.gachaTs.data(), uItem.gachaTs.data() + uItem.gachaTs.size(), uItem.parsed_ts);
+                        
+                        localIds.push_back(uItem.parsed_id);
+                        allRecords.push_back(std::move(uItem));
+                    });
+                    UnmapViewOfFile(mapData);
                 }
-                printf("成功加载本地存储的 %zu 条抽卡记录。\n", localRecordsDict.size());
+                CloseHandle(hMap);
             }
         }
         CloseHandle(hFile);
+        
+        // 对本地 ID 排序，以便后续进行 O(log N) 的极速查重
+        std::ranges::sort(localIds);
+        printf("成功加载本地存储的 %zu 条抽卡记录。\n", allRecords.size());
     } else {
         printf("未发现本地记录，将创建新文件。\n");
     }
@@ -217,6 +247,8 @@ int main() {
     if (!hConnect) {
         printf("网络初始化失败！\n"); system("pause"); return 1;
     }
+
+    std::unordered_set<long long> sessionIds; // 当前会话的防重击机制，数据量小，保留 unordered_set
 
     for (const auto& pool : pools) {
         printf("\n>>> 正在抓取 [%s] ...\n", pool.displayName.c_str());
@@ -233,31 +265,35 @@ int main() {
             std::string resStr = FetchPath(hConnect, Utf8ToWstring(currentPath));
             if (resStr.empty()) { printf("  [错误] 网络请求失败或 Token 已失效。\n"); break; }
 
-            std::string codeStr = ExtractJsonValue(resStr, "code", false);
+            std::string_view resView(resStr);
+            std::string_view codeStr = ExtractJsonValue(resView, "code", false);
             if (codeStr.empty()) { printf("  [错误] 接口返回了非 JSON 数据或格式异常。\n"); break; }
             if (codeStr != "0") {
-                printf("  [提示] 接口返回信息: %s\n", ExtractJsonValue(resStr, "msg", true).c_str());
+                printf("  [提示] 接口返回信息: %s\n", std::string(ExtractJsonValue(resView, "msg", true)).c_str());
                 break;
             }
 
-            std::vector<std::string> listObj = ExtractJsonObjects(resStr, "list");
-            if (listObj.empty()) break; 
+            long long lastSeqParsed = 0;
+            ForEachJsonObject(resView, "list", [&](std::string_view itemStr) {
+                if (reachedExisting) return; // 回调中如果已触达底线则跳过剩余解析
 
-            for (const auto& itemStr : listObj) {
-                std::string rawSeqIdStr = ExtractJsonValue(itemStr, "seqId", true);
-                if (rawSeqIdStr.empty()) continue;
+                std::string_view rawSeqIdStr = ExtractJsonValue(itemStr, "seqId", true);
+                if (rawSeqIdStr.empty()) return;
 
-                long long rawSeqId = std::strtoll(rawSeqIdStr.c_str(), nullptr, 10);
+                long long rawSeqId = 0;
+                std::from_chars(rawSeqIdStr.data(), rawSeqIdStr.data() + rawSeqIdStr.size(), rawSeqId);
+                lastSeqParsed = rawSeqId;
                 long long safeUniqueId = pool.isWeapon ? -rawSeqId : rawSeqId;
                 
-                if (localRecordsDict.contains(safeUniqueId)) {
+                // 二分极速查重
+                if (std::ranges::binary_search(localIds, safeUniqueId)) {
                     reachedExisting = true;
-                    printf("  * 触达本地老记录 (ID: %s)，停止追溯。\n", rawSeqIdStr.c_str());
-                    break;
+                    printf("  * 触达本地老记录 (ID: %lld)，停止追溯。\n", rawSeqId);
+                    return;
                 }
-                if (sessionRecordsDict.contains(safeUniqueId)) {
-                    printf("\n  [警告] 遇到重复数据 (ID: %s)，防死循环中止。\n", rawSeqIdStr.c_str());
-                    hasMore = false; break;
+                if (sessionIds.contains(safeUniqueId)) {
+                    printf("\n  [警告] 遇到重复数据 (ID: %lld)，防死循环中止。\n", rawSeqId);
+                    hasMore = false; return;
                 }
 
                 UIGFItem uItem;
@@ -278,25 +314,26 @@ int main() {
                     uItem.item_type = "Character";
                 }
                 
-                std::string tsStr = ExtractJsonValue(itemStr, "gachaTs", true);
-                uItem.parsed_ts = std::strtoll(tsStr.c_str(), nullptr, 10);
+                std::string_view tsStr = ExtractJsonValue(itemStr, "gachaTs", true);
+                if (!tsStr.empty()) std::from_chars(tsStr.data(), tsStr.data() + tsStr.size(), uItem.parsed_ts);
+                
                 uItem.time = MsToTimeString(uItem.parsed_ts); 
                 uItem.gachaTs = tsStr;
                 uItem.isNew = (ExtractJsonValue(itemStr, "isNew", false) == "true");
                 uItem.isFree = (ExtractJsonValue(itemStr, "isFree", false) == "true");
 
-                sessionRecordsDict[safeUniqueId] = uItem;
+                sessionIds.insert(safeUniqueId);
+                allRecords.push_back(std::move(uItem));
                 poolFetchedCount++;
-                printf("  获取到: %s (%s 星) [%s] - %s\n", uItem.name.c_str(), uItem.rank_type.c_str(), uItem.poolName.c_str(), uItem.time.c_str());
-            }
+                printf("  获取到: %s (%s 星) [%s] - %s\n", allRecords.back().name.c_str(), allRecords.back().rank_type.c_str(), allRecords.back().poolName.c_str(), allRecords.back().time.c_str());
+            });
 
             if (reachedExisting || !hasMore) break;
             
-            std::string lastSeqStr = ExtractJsonValue(listObj.back(), "seqId", true);
-            nextSeqIdCursor = lastSeqStr.empty() ? 0 : std::strtoll(lastSeqStr.c_str(), nullptr, 10);
-            hasMore = (ExtractJsonValue(resStr, "hasMore", false) == "true");
+            nextSeqIdCursor = lastSeqParsed;
+            hasMore = (ExtractJsonValue(resView, "hasMore", false) == "true");
             page++;
-            Sleep(300); // 替换 std::this_thread::sleep_for
+            Sleep(300); 
         }
         printf(">>> [%s] 抓取完成，本次新增拉取: %d 条。\n", pool.displayName.c_str(), poolFetchedCount);
         Sleep(500);
@@ -306,14 +343,10 @@ int main() {
     if (hSession) WinHttpCloseHandle(hSession);
 
     printf("\n========================================\n");
-    printf("已完成全部抓取！总计新增拉取了 %zu 条记录。\n", sessionRecordsDict.size());
+    printf("已完成全部抓取！总计新增拉取了 %zu 条记录。\n", sessionIds.size());
 
-    std::vector<UIGFItem> mergedList;
-    mergedList.reserve(localRecordsDict.size() + sessionRecordsDict.size());
-    for (auto& [id, record] : localRecordsDict) mergedList.push_back(std::move(record));
-    for (auto& [id, record] : sessionRecordsDict) mergedList.push_back(std::move(record));
-
-    std::ranges::sort(mergedList, [](const UIGFItem& a, const UIGFItem& b) {
+    // 统一排序
+    std::ranges::sort(allRecords, [](const UIGFItem& a, const UIGFItem& b) {
         bool isWeaponA = a.parsed_id < 0, isWeaponB = b.parsed_id < 0;
         if (isWeaponA != isWeaponB) return isWeaponA < isWeaponB; 
         if (a.parsed_ts != b.parsed_ts) return a.parsed_ts < b.parsed_ts;
@@ -325,33 +358,41 @@ int main() {
     long long export_ts = (long long)rawtime;
     std::string export_time = MsToTimeString(export_ts * 1000);
 
-    std::string outStr = "{\n    \"info\": {\n";
-    outStr += "        \"uid\": \"0\",\n        \"lang\": \"zh-cn\",\n";
-    outStr += "        \"export_time\": \"" + export_time + "\",\n";
-    outStr += "        \"export_timestamp\": " + std::to_string(export_ts) + ",\n";
-    outStr += "        \"export_app\": \"Endfield Exporter\",\n        \"export_app_version\": \"v2.3.0\",\n        \"uigf_version\": \"v3.0\"\n    },\n";
-    outStr += "    \"list\": [\n";
-
-    for (size_t i = 0; i < mergedList.size(); ++i) {
-        const auto& p = mergedList[i];
-        outStr += "        {\n            \"uigf_gacha_type\": \"" + EscapeJsonStr(p.uigf_gacha_type) + "\",\n";
-        outStr += "            \"id\": \"" + EscapeJsonStr(p.id) + "\",\n            \"item_id\": \"" + EscapeJsonStr(p.item_id) + "\",\n";
-        outStr += "            \"name\": \"" + EscapeJsonStr(p.name) + "\",\n            \"item_type\": \"" + EscapeJsonStr(p.item_type) + "\",\n";
-        outStr += "            \"rank_type\": \"" + EscapeJsonStr(p.rank_type) + "\",\n            \"time\": \"" + EscapeJsonStr(p.time) + "\",\n";
-        outStr += "            \"gachaTs\": \"" + EscapeJsonStr(p.gachaTs) + "\",\n";
-        if (!p.poolName.empty()) outStr += "            \"poolName\": \"" + EscapeJsonStr(p.poolName) + "\",\n";
-        if (!p.weaponType.empty()) outStr += "            \"weaponType\": \"" + EscapeJsonStr(p.weaponType) + "\",\n";
-        outStr += "            \"isNew\": " + std::string(p.isNew ? "true" : "false") + ",\n";
-        outStr += "            \"isFree\": " + std::string(p.isFree ? "true" : "false") + "\n        }";
-        if (i < mergedList.size() - 1) outStr += ",";
-        outStr += "\n";
-    }
-    outStr += "    ]\n}\n";
-
+    // 流式切片写入 (完美化解写文件内存膨胀)
     HANDLE hOut = CreateFileA(uigfFilename.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hOut != INVALID_HANDLE_VALUE) {
-        DWORD bytesWritten;
-        WriteFile(hOut, outStr.data(), (DWORD)outStr.size(), &bytesWritten, NULL);
+        auto WriteString = [&](const std::string& s) {
+            DWORD bytesWritten;
+            WriteFile(hOut, s.data(), (DWORD)s.size(), &bytesWritten, NULL);
+        };
+
+        std::string header = "{\n    \"info\": {\n";
+        header += "        \"uid\": \"0\",\n        \"lang\": \"zh-cn\",\n";
+        header += "        \"export_time\": \"" + export_time + "\",\n";
+        header += "        \"export_timestamp\": " + std::to_string(export_ts) + ",\n";
+        header += "        \"export_app\": \"Endfield Exporter\",\n        \"export_app_version\": \"v2.3.0\",\n        \"uigf_version\": \"v3.0\"\n    },\n";
+        header += "    \"list\": [\n";
+        WriteString(header);
+
+        for (size_t i = 0; i < allRecords.size(); ++i) {
+            const auto& p = allRecords[i];
+            std::string itemStr = "        {\n            \"uigf_gacha_type\": \"" + EscapeJsonStr(p.uigf_gacha_type) + "\",\n";
+            itemStr += "            \"id\": \"" + EscapeJsonStr(p.id) + "\",\n            \"item_id\": \"" + EscapeJsonStr(p.item_id) + "\",\n";
+            itemStr += "            \"name\": \"" + EscapeJsonStr(p.name) + "\",\n            \"item_type\": \"" + EscapeJsonStr(p.item_type) + "\",\n";
+            itemStr += "            \"rank_type\": \"" + EscapeJsonStr(p.rank_type) + "\",\n            \"time\": \"" + EscapeJsonStr(p.time) + "\",\n";
+            itemStr += "            \"gachaTs\": \"" + EscapeJsonStr(p.gachaTs) + "\",\n";
+            if (!p.poolName.empty()) itemStr += "            \"poolName\": \"" + EscapeJsonStr(p.poolName) + "\",\n";
+            if (!p.weaponType.empty()) itemStr += "            \"weaponType\": \"" + EscapeJsonStr(p.weaponType) + "\",\n";
+            itemStr += "            \"isNew\": " + std::string(p.isNew ? "true" : "false") + ",\n";
+            itemStr += "            \"isFree\": " + std::string(p.isFree ? "true" : "false") + "\n        }";
+            
+            if (i < allRecords.size() - 1) itemStr += ",";
+            itemStr += "\n";
+            
+            WriteString(itemStr);
+        }
+        
+        WriteString("    ]\n}\n");
         CloseHandle(hOut);
         printf("已成功更新记录并保存至: %s\n", uigfFilename.c_str());
     } else {
