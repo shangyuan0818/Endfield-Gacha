@@ -209,7 +209,7 @@ int main() {
     SetConsoleOutputCP(CP_UTF8);
 
     char urlBuffer[1024];
-    printf("请输入您的终末地抽卡记录链接:\n> ");
+    printf("请输入您的终末地抽卡记录完整链接 (https://ef-webview.gryphline.com/api/record/<参数>):\n> ");
     if (!fgets(urlBuffer, sizeof(urlBuffer), stdin)) return 1;
     
     std::string_view inputUrl(urlBuffer);
