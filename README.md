@@ -45,4 +45,4 @@ CPU 处理器: x64 (amd64) 64位
 
 
 # Demostrate 效果展示
-<img width="1253" height="1339" alt="image" src="https://github.com/user-attachments/assets/07019bb9-2490-4737-b449-ef75fc5ff3ac" />
+<img width="1920" height="1320" alt="image" src="https://github.com/user-attachments/assets/b074b8e5-024e-455a-b659-b0510003977e" />
