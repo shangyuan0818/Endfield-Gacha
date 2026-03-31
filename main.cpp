@@ -12,6 +12,7 @@
 #include <ranges>
 
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "User32.lib")
 
 // ---------------------------------------------------------
 // [极简 JSON 解析模块 - 零分配纯净版]
@@ -39,7 +40,7 @@ std::string_view ExtractJsonValue(std::string_view source, std::string_view key,
     while (pos < source.length() && (source[pos] == ' ' || source[pos] == '\t' || source[pos] == '\n' || source[pos] == '\r')) pos++;
     
     if (isString) {
-        if (source[pos] != '"') return {};
+        if (pos >= source.length() || source[pos] != '"') return {};
         pos++; 
         auto endPos = pos;
         while (endPos < source.length() && source[endPos] != '"') {
@@ -49,7 +50,7 @@ std::string_view ExtractJsonValue(std::string_view source, std::string_view key,
         return (endPos < source.length()) ? source.substr(pos, endPos - pos) : std::string_view{};
     } else {
         auto endPos = pos;
-        while (endPos < source.length() && source[endPos] != ',' && source[endPos] != '}' && source[endPos] != ' ' && source[endPos] != '\n' && source[endPos] != '\r') endPos++;
+        while (endPos < source.length() && source[endPos] != ',' && source[endPos] != '}' && source[endPos] != ']' && source[endPos] != ' ' && source[endPos] != '\n' && source[endPos] != '\r') endPos++;
         return source.substr(pos, endPos - pos);
     }
 }
@@ -67,65 +68,59 @@ void ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callb
     int depth = 0;
     size_t objStart = 0;
     for (size_t i = pos; i < source.length(); ++i) {
-        if (source[i] == '{') {
+        char c = source[i];
+        // FIX: 跳过字符串内容，避免值中的 { } 干扰层级计数
+        if (c == '"') {
+            for (++i; i < source.length(); ++i) {
+                if (source[i] == '\\') { ++i; continue; }
+                if (source[i] == '"') break;
+            }
+            continue;
+        }
+        if (c == '{') {
             if (depth == 0) objStart = i;
             depth++;
-        } else if (source[i] == '}') {
+        } else if (c == '}') {
             depth--;
             if (depth == 0) cb(source.substr(objStart, i - objStart + 1));
-        } else if (source[i] == ']' && depth == 0) break;
+        } else if (c == ']' && depth == 0) break;
     }
-}
-
-std::string EscapeJsonStr(std::string_view s) {
-    std::string res;
-    res.reserve(s.size() + 10);
-    for (char c : s) {
-        if (c == '"') res += "\\\"";
-        else if (c == '\\') res += "\\\\";
-        else res += c;
-    }
-    return res;
 }
 // ---------------------------------------------------------
 
 std::wstring Utf8ToWstring(std::string_view str) {
-    if (str.empty()) return std::wstring();
+    if (str.empty()) return {};
     int size = MultiByteToWideChar(CP_UTF8, 0, str.data(), (int)str.size(), nullptr, 0);
     std::wstring result(size, 0);
     MultiByteToWideChar(CP_UTF8, 0, str.data(), (int)str.size(), result.data(), size);
     return result;
 }
 
+// Win32 wsprintfA 替代 snprintf (减少 CRT 依赖)
 std::string MsToTimeString(long long ms) {
     time_t t = ms / 1000;
     struct tm tm_info;
     localtime_s(&tm_info, &t);
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+    wsprintfA(buf, "%04d-%02d-%02d %02d:%02d:%02d",
         tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
         tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
     return std::string(buf);
 }
 
-std::string ExtractToken(const std::string& url) {
-    std::string key = "token=";
-    auto pos = url.find(key);
-    if (pos == std::string::npos) return "";
-    pos += key.length();
-    auto endPos = url.find("&", pos);
-    if (endPos == std::string::npos) return url.substr(pos);
-    return url.substr(pos, endPos - pos);
+// charconv 替代 std::to_string (零分配, 栈上完成)
+char* I64ToStr(long long val, char* buf) {
+    auto [ptr, ec] = std::to_chars(buf, buf + 20, val);
+    *ptr = '\0';
+    return buf;
 }
 
-std::string ExtractServerId(const std::string& url) {
-    std::string key = "server_id=";
-    auto pos = url.find(key);
-    if (pos == std::string::npos) return "1"; 
+std::string_view ExtractUrlParam(std::string_view url, std::string_view key) {
+    size_t pos = url.find(key);
+    if (pos == std::string_view::npos) return {};
     pos += key.length();
-    auto endPos = url.find("&", pos);
-    if (endPos == std::string::npos) return url.substr(pos);
-    return url.substr(pos, endPos - pos);
+    size_t end = url.find('&', pos);
+    return (end == std::string_view::npos) ? url.substr(pos) : url.substr(pos, end - pos);
 }
 
 struct UIGFItem {
@@ -141,12 +136,18 @@ std::string FetchPath(HINTERNET hConnect, const std::wstring& path) {
         if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
             WinHttpReceiveResponse(hRequest, NULL)) {
             DWORD dwSize = 0, dwDownloaded = 0;
+            char stackBuf[8192]; // 栈上复用 buffer，避免每次循环 heap 分配
             do {
                 WinHttpQueryDataAvailable(hRequest, &dwSize);
                 if (dwSize == 0) break;
-                std::vector<char> buffer(dwSize + 1, 0);
-                if (WinHttpReadData(hRequest, buffer.data(), dwSize, &dwDownloaded)) {
-                    response.append(buffer.data(), dwDownloaded);
+                if (dwSize <= sizeof(stackBuf)) {
+                    if (WinHttpReadData(hRequest, stackBuf, dwSize, &dwDownloaded))
+                        response.append(stackBuf, dwDownloaded);
+                } else {
+                    // 极端情况: 数据块超大，fallback 到堆分配
+                    std::vector<char> heapBuf(dwSize);
+                    if (WinHttpReadData(hRequest, heapBuf.data(), dwSize, &dwDownloaded))
+                        response.append(heapBuf.data(), dwDownloaded);
                 }
             } while (dwSize > 0);
         }
@@ -157,6 +158,53 @@ std::string FetchPath(HINTERNET hConnect, const std::wstring& path) {
 
 struct PoolConfig { std::string poolType, displayName; bool isWeapon; };
 
+// ---------------------------------------------------------
+// 缓冲写入器: 攒满 buffer 再一次性 WriteFile，减少系统调用
+// ---------------------------------------------------------
+struct BufferedWriter {
+    HANDLE hFile;
+    char buf[65536];
+    DWORD pos = 0;
+    
+    void Flush() {
+        if (pos > 0) {
+            DWORD written;
+            WriteFile(hFile, buf, pos, &written, NULL);
+            pos = 0;
+        }
+    }
+    void Write(const char* data, DWORD len) {
+        while (len > 0) {
+            DWORD space = sizeof(buf) - pos;
+            DWORD chunk = (len < space) ? len : space;
+            CopyMemory(buf + pos, data, chunk);
+            pos += chunk; data += chunk; len -= chunk;
+            if (pos == sizeof(buf)) Flush();
+        }
+    }
+    // 只需要保留 string_view 的重载即可
+    void Write(std::string_view sv) { Write(sv.data(), (DWORD)sv.size()); }
+    // void Write(const std::string& s) { Write(s.data(), (DWORD)s.size()); }
+    
+    // 直接写入 JSON 转义字符串 (避免 EscapeJsonStr 的临时 string 分配)
+    void WriteEscaped(std::string_view s) {
+        for (char c : s) {
+            if (c == '"')       { Write("\\\"", 2); }
+            else if (c == '\\') { Write("\\\\", 2); }
+            else                { Write(&c, 1); }
+        }
+    }
+    
+    // 写入 "key": "escaped_value" 格式
+    void WriteKV(std::string_view key, std::string_view val) {
+        Write("            \"", 13);
+        Write(key);
+        Write("\": \"", 4);
+        WriteEscaped(val);
+        Write("\"", 1);
+    }
+};
+
 int main() {
     SetConsoleOutputCP(CP_UTF8);
 
@@ -164,16 +212,19 @@ int main() {
     printf("请输入您的终末地抽卡记录链接:\n> ");
     if (!fgets(urlBuffer, sizeof(urlBuffer), stdin)) return 1;
     
-    std::string inputUrl(urlBuffer);
-    inputUrl.erase(inputUrl.find_last_not_of(" \n\r\t") + 1);
+    std::string_view inputUrl(urlBuffer);
+    // trim trailing whitespace
+    while (!inputUrl.empty() && (inputUrl.back() == ' ' || inputUrl.back() == '\n' || inputUrl.back() == '\r' || inputUrl.back() == '\t'))
+        inputUrl.remove_suffix(1);
 
-    std::string token = ExtractToken(inputUrl);
+    auto token = ExtractUrlParam(inputUrl, "token=");
     if (token.empty()) {
         printf("错误: 无法提取 token。\n"); system("pause"); return 1;
     }
     
-    std::string serverId = ExtractServerId(inputUrl);
-    printf("\n已自动识别 Server ID: %s\n", serverId.c_str());
+    auto serverId = ExtractUrlParam(inputUrl, "server_id=");
+    if (serverId.empty()) serverId = "1";
+    printf("\n已自动识别 Server ID: %.*s\n", (int)serverId.size(), serverId.data());
 
     std::vector<PoolConfig> pools = {
         {"E_CharacterGachaPoolType_Special", "角色 - 特许寻访", false},
@@ -184,9 +235,10 @@ int main() {
     
     std::string uigfFilename = "uigf_endfield.json";
     
-    // 摒弃 unordered_map，使用 vector 存储，并在查重时使用二分查找
+    // FIX: 使用 unordered_set 替代 sorted vector + binary_search
+    // 查重从 O(logN) 降为 O(1)，且省去 O(NlogN) 排序
     std::vector<UIGFItem> allRecords;
-    std::vector<long long> localIds; 
+    std::unordered_set<long long> localIds;
     
     HANDLE hFile = CreateFileA(uigfFilename.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile != INVALID_HANDLE_VALUE) {
@@ -211,16 +263,13 @@ int main() {
                         uItem.poolName = ExtractJsonValue(itemStr, "poolName", true);
                         uItem.weaponType = ExtractJsonValue(itemStr, "weaponType", true);
                         
-                        std::string_view isNewStr = ExtractJsonValue(itemStr, "isNew", false);
-                        uItem.isNew = (isNewStr == "true");
-                        
-                        std::string_view isFreeStr = ExtractJsonValue(itemStr, "isFree", false);
-                        uItem.isFree = (isFreeStr == "true");
+                        uItem.isNew = (ExtractJsonValue(itemStr, "isNew", false) == "true");
+                        uItem.isFree = (ExtractJsonValue(itemStr, "isFree", false) == "true");
                         
                         if (!uItem.id.empty()) std::from_chars(uItem.id.data(), uItem.id.data() + uItem.id.size(), uItem.parsed_id);
                         if (!uItem.gachaTs.empty()) std::from_chars(uItem.gachaTs.data(), uItem.gachaTs.data() + uItem.gachaTs.size(), uItem.parsed_ts);
                         
-                        localIds.push_back(uItem.parsed_id);
+                        localIds.insert(uItem.parsed_id);
                         allRecords.push_back(std::move(uItem));
                     });
                     UnmapViewOfFile(mapData);
@@ -230,11 +279,18 @@ int main() {
         }
         CloseHandle(hFile);
         
-        // 对本地 ID 排序，以便后续进行 O(log N) 的极速查重
-        std::ranges::sort(localIds);
         printf("成功加载本地存储的 %zu 条抽卡记录。\n", allRecords.size());
     } else {
         printf("未发现本地记录，将创建新文件。\n");
+    }
+
+    // 极简判断：只要 URL 中包含 "hypergryph" 即为国服，否则全部视为国际服
+    std::wstring hostName = L"ef-webview.gryphline.com";
+    if (inputUrl.find("hypergryph") != std::string_view::npos) {
+        hostName = L"ef-webview.hypergryph.com";
+        printf("已自动识别区服: 国服 (Hypergryph)\n");
+    } else {
+        printf("已自动识别区服: 国际服 (Gryphline)\n");
     }
 
     printf("\n========================================\n");
@@ -242,25 +298,32 @@ int main() {
     printf("========================================\n");
 
     HINTERNET hSession = WinHttpOpen(L"Endfield Gacha Tool", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    HINTERNET hConnect = hSession ? WinHttpConnect(hSession, L"ef-webview.gryphline.com", INTERNET_DEFAULT_HTTPS_PORT, 0) : NULL;
-
+    HINTERNET hConnect = hSession ? WinHttpConnect(hSession, hostName.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0) : NULL;
     if (!hConnect) {
         printf("网络初始化失败！\n"); system("pause"); return 1;
     }
 
-    std::unordered_set<long long> sessionIds; // 当前会话的防重击机制，数据量小，保留 unordered_set
+    std::unordered_set<long long> sessionIds;
+    
+    // 预构建 token/serverId 的 string 以供路径拼接
+    std::string tokenStr(token);
+    std::string serverIdStr(serverId);
 
     for (const auto& pool : pools) {
         printf("\n>>> 正在抓取 [%s] ...\n", pool.displayName.c_str());
         bool hasMore = true, reachedExisting = false;
         long long nextSeqIdCursor = 0; 
         int page = 1, poolFetchedCount = 0;
+        char seqIdBuf[24];
 
         while (hasMore && !reachedExisting) {
             std::string currentPath = pool.isWeapon 
-                ? "/api/record/weapon?lang=zh-cn&token=" + token + "&server_id=" + serverId
-                : "/api/record/char?lang=zh-cn&pool_type=" + pool.poolType + "&token=" + token + "&server_id=" + serverId;
-            if (page > 1 && nextSeqIdCursor > 0) currentPath += "&seq_id=" + std::to_string(nextSeqIdCursor);
+                ? "/api/record/weapon?lang=zh-cn&token=" + tokenStr + "&server_id=" + serverIdStr
+                : "/api/record/char?lang=zh-cn&pool_type=" + pool.poolType + "&token=" + tokenStr + "&server_id=" + serverIdStr;
+            if (page > 1 && nextSeqIdCursor > 0) {
+                currentPath += "&seq_id=";
+                currentPath += I64ToStr(nextSeqIdCursor, seqIdBuf);
+            }
 
             std::string resStr = FetchPath(hConnect, Utf8ToWstring(currentPath));
             if (resStr.empty()) { printf("  [错误] 网络请求失败或 Token 已失效。\n"); break; }
@@ -269,13 +332,13 @@ int main() {
             std::string_view codeStr = ExtractJsonValue(resView, "code", false);
             if (codeStr.empty()) { printf("  [错误] 接口返回了非 JSON 数据或格式异常。\n"); break; }
             if (codeStr != "0") {
-                printf("  [提示] 接口返回信息: %s\n", std::string(ExtractJsonValue(resView, "msg", true)).c_str());
+                printf("  [提示] 接口返回信息: %.*s\n", (int)ExtractJsonValue(resView, "msg", true).size(), ExtractJsonValue(resView, "msg", true).data());
                 break;
             }
 
             long long lastSeqParsed = 0;
             ForEachJsonObject(resView, "list", [&](std::string_view itemStr) {
-                if (reachedExisting) return; // 回调中如果已触达底线则跳过剩余解析
+                if (reachedExisting) return;
 
                 std::string_view rawSeqIdStr = ExtractJsonValue(itemStr, "seqId", true);
                 if (rawSeqIdStr.empty()) return;
@@ -285,8 +348,8 @@ int main() {
                 lastSeqParsed = rawSeqId;
                 long long safeUniqueId = pool.isWeapon ? -rawSeqId : rawSeqId;
                 
-                // 二分极速查重
-                if (std::ranges::binary_search(localIds, safeUniqueId)) {
+                // O(1) 哈希查重 (替代原 O(logN) 二分)
+                if (localIds.contains(safeUniqueId)) {
                     reachedExisting = true;
                     printf("  * 触达本地老记录 (ID: %lld)，停止追溯。\n", rawSeqId);
                     return;
@@ -298,7 +361,9 @@ int main() {
 
                 UIGFItem uItem;
                 uItem.uigf_gacha_type = ExtractJsonValue(itemStr, "poolId", true);
-                uItem.id = std::to_string(safeUniqueId); 
+                
+                char idBuf[24];
+                uItem.id = I64ToStr(safeUniqueId, idBuf);
                 uItem.parsed_id = safeUniqueId; 
                 uItem.rank_type = ExtractJsonValue(itemStr, "rarity", false);
                 uItem.poolName = ExtractJsonValue(itemStr, "poolName", true);
@@ -345,7 +410,7 @@ int main() {
     printf("\n========================================\n");
     printf("已完成全部抓取！总计新增拉取了 %zu 条记录。\n", sessionIds.size());
 
-    // 统一排序
+    // 统一排序: 角色在前武器在后，同类按时间戳+ID排序
     std::ranges::sort(allRecords, [](const UIGFItem& a, const UIGFItem& b) {
         bool isWeaponA = a.parsed_id < 0, isWeaponB = b.parsed_id < 0;
         if (isWeaponA != isWeaponB) return isWeaponA < isWeaponB; 
@@ -358,41 +423,45 @@ int main() {
     long long export_ts = (long long)rawtime;
     std::string export_time = MsToTimeString(export_ts * 1000);
 
-    // 流式切片写入 (完美化解写文件内存膨胀)
+    // 缓冲写入器: 攒满64KB再WriteFile，大幅减少系统调用
     HANDLE hOut = CreateFileA(uigfFilename.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hOut != INVALID_HANDLE_VALUE) {
-        auto WriteString = [&](const std::string& s) {
-            DWORD bytesWritten;
-            WriteFile(hOut, s.data(), (DWORD)s.size(), &bytesWritten, NULL);
-        };
-
-        std::string header = "{\n    \"info\": {\n";
-        header += "        \"uid\": \"0\",\n        \"lang\": \"zh-cn\",\n";
-        header += "        \"export_time\": \"" + export_time + "\",\n";
-        header += "        \"export_timestamp\": " + std::to_string(export_ts) + ",\n";
-        header += "        \"export_app\": \"Endfield Exporter\",\n        \"export_app_version\": \"v2.3.0\",\n        \"uigf_version\": \"v3.0\"\n    },\n";
-        header += "    \"list\": [\n";
-        WriteString(header);
+        BufferedWriter w{hOut};
+        char numBuf[24];
+        
+        w.Write("{\n    \"info\": {\n");
+        w.Write("        \"uid\": \"0\",\n        \"lang\": \"zh-cn\",\n");
+        w.Write("        \"export_time\": \""); w.Write(export_time); w.Write("\",\n");
+        w.Write("        \"export_timestamp\": "); w.Write(I64ToStr(export_ts, numBuf)); w.Write(",\n");
+        w.Write("        \"export_app\": \"Endfield Exporter\",\n        \"export_app_version\": \"v2.3.0\",\n        \"uigf_version\": \"v3.0\"\n    },\n");
+ w.Write("    \"list\": [\n");
 
         for (size_t i = 0; i < allRecords.size(); ++i) {
             const auto& p = allRecords[i];
-            std::string itemStr = "        {\n            \"uigf_gacha_type\": \"" + EscapeJsonStr(p.uigf_gacha_type) + "\",\n";
-            itemStr += "            \"id\": \"" + EscapeJsonStr(p.id) + "\",\n            \"item_id\": \"" + EscapeJsonStr(p.item_id) + "\",\n";
-            itemStr += "            \"name\": \"" + EscapeJsonStr(p.name) + "\",\n            \"item_type\": \"" + EscapeJsonStr(p.item_type) + "\",\n";
-            itemStr += "            \"rank_type\": \"" + EscapeJsonStr(p.rank_type) + "\",\n            \"time\": \"" + EscapeJsonStr(p.time) + "\",\n";
-            itemStr += "            \"gachaTs\": \"" + EscapeJsonStr(p.gachaTs) + "\",\n";
-            if (!p.poolName.empty()) itemStr += "            \"poolName\": \"" + EscapeJsonStr(p.poolName) + "\",\n";
-            if (!p.weaponType.empty()) itemStr += "            \"weaponType\": \"" + EscapeJsonStr(p.weaponType) + "\",\n";
-            itemStr += "            \"isNew\": " + std::string(p.isNew ? "true" : "false") + ",\n";
-            itemStr += "            \"isFree\": " + std::string(p.isFree ? "true" : "false") + "\n        }";
             
-            if (i < allRecords.size() - 1) itemStr += ",";
-            itemStr += "\n";
+            w.Write("        {\n");
             
-            WriteString(itemStr);
+            // 直接流式写入，零临时 string 分配
+            w.WriteKV("uigf_gacha_type", p.uigf_gacha_type); w.Write(",\n");
+            w.WriteKV("id", p.id); w.Write(",\n");
+            w.WriteKV("item_id", p.item_id); w.Write(",\n");
+            w.WriteKV("name", p.name); w.Write(",\n");
+            w.WriteKV("item_type", p.item_type); w.Write(",\n");
+            w.WriteKV("rank_type", p.rank_type); w.Write(",\n");
+            w.WriteKV("time", p.time); w.Write(",\n");
+            w.WriteKV("gachaTs", p.gachaTs); w.Write(",\n");
+            if (!p.poolName.empty()) { w.WriteKV("poolName", p.poolName); w.Write(",\n"); }
+            if (!p.weaponType.empty()) { w.WriteKV("weaponType", p.weaponType); w.Write(",\n"); }
+            w.Write("            \"isNew\": "); w.Write(p.isNew ? "true" : "false"); w.Write(",\n");
+            w.Write("            \"isFree\": "); w.Write(p.isFree ? "true" : "false"); w.Write("\n");
+            w.Write("        }");
+            
+            if (i < allRecords.size() - 1) w.Write(",");
+            w.Write("\n");
         }
         
-        WriteString("    ]\n}\n");
+        w.Write("    ]\n}\n");
+        w.Flush();
         CloseHandle(hOut);
         printf("已成功更新记录并保存至: %s\n", uigfFilename.c_str());
     } else {
