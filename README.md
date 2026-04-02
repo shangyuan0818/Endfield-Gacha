@@ -45,4 +45,5 @@ CPU 处理器: i386 and amd64 (x86 and x64) 32位和64位
 
 
 # Demostrate 效果展示
-<img width="1920" height="1320" alt="image" src="https://github.com/user-attachments/assets/b074b8e5-024e-455a-b659-b0510003977e" />
+<img width="1920" height="1320" alt="image" src="https://github.com/user-attachments/assets/ae217254-49b4-4c24-a79f-d0c413976741" />
+
