@@ -186,12 +186,21 @@ struct BufferedWriter {
     void Write(std::string_view sv) { Write(sv.data(), (DWORD)sv.size()); }
     // void Write(const std::string& s) { Write(s.data(), (DWORD)s.size()); }
     
-    // 直接写入 JSON 转义字符串 (避免 EscapeJsonStr 的临时 string 分配)
+    // 批量写入 JSON 转义字符串: 扫描到下一个特殊字符后一次性写入干净段
     void WriteEscaped(std::string_view s) {
-        for (char c : s) {
-            if (c == '"')       { Write("\\\"", 2); }
-            else if (c == '\\') { Write("\\\\", 2); }
-            else                { Write(&c, 1); }
+        const char* p = s.data();
+        const char* end = p + s.size();
+        while (p < end) {
+            // 扫描干净段 (无需转义的连续字符)
+            const char* clean = p;
+            while (p < end && *p != '"' && *p != '\\') ++p;
+            if (p > clean) Write(clean, (DWORD)(p - clean)); // 批量写入
+            // 处理特殊字符
+            if (p < end) {
+                if (*p == '"')       Write("\\\"", 2);
+                else if (*p == '\\') Write("\\\\", 2);
+                ++p;
+            }
         }
     }
     
@@ -332,7 +341,8 @@ int main() {
             std::string_view codeStr = ExtractJsonValue(resView, "code", false);
             if (codeStr.empty()) { printf("  [错误] 接口返回了非 JSON 数据或格式异常。\n"); break; }
             if (codeStr != "0") {
-                printf("  [提示] 接口返回信息: %.*s\n", (int)ExtractJsonValue(resView, "msg", true).size(), ExtractJsonValue(resView, "msg", true).data());
+                auto msgStr = ExtractJsonValue(resView, "msg", true);
+                printf("  [提示] 接口返回信息: %.*s\n", (int)msgStr.size(), msgStr.data());
                 break;
             }
 
