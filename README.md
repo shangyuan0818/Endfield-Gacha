@@ -40,7 +40,7 @@ Press enter to run the command
 # Compatibility 兼容性
 System 系统: Windows 10 or higher 视窗10或更高
 
-CPU 处理器: x64 (amd64) 64位
+CPU 处理器: i386 and amd64 (x86 and x64) 32位和64位
 
 
 
