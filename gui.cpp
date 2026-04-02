@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <commctrl.h>
+#include <richedit.h>
 #include <gdiplus.h>
 #include <string>
 #include <vector>
@@ -126,6 +127,7 @@ struct Stats {
 
 Stats statsChar, statsWep;
 HWND hOutEdit, hCharEdit, hWepEdit, hPoolMapEdit;
+static HBITMAP g_hChartBmp = NULL;  // 预渲染图表缓存 (消灭 WM_PAINT 卡顿)
 
 std::unordered_set<std::wstring> ParseCommaSeparated(const std::wstring& text) {
     std::unordered_set<std::wstring> result; std::wstring cur;
@@ -162,49 +164,39 @@ std::unordered_map<std::wstring, std::wstring> ParsePoolMap(const std::wstring& 
 }
 
 // -------------------------------------------------------
-// 终末地角色池理论CDF (用于K-S检验)
-//   基础概率 0.8% (1~65抽)
-//   第66抽起: 5.8%, 每抽+5%, 第80抽100%
+// 理论 CDF 预计算表 (启动时一次性生成, 后续 O(1) 查表)
+// 角色池: 0.8% (1~65), 5.8%+5%/抽 (66~79), 100% (80)
+// 武器池: 4% (1~39), 100% (40)
 // -------------------------------------------------------
-double GetTheoreticalCDF_Char(int x) {
-    double cum = 0.0, surv = 1.0;
-    for (int i = 1; i <= x; ++i) {
-        double p;
-        if (i <= 65)      p = 0.008;
-        else if (i <= 79)  p = 0.058 + (i - 66) * 0.05;
-        else               p = 1.0;    // 第80抽硬保底
-        cum += surv * p;
+static double g_cdf_char[81] = {};  // [0]=0, [1..80]=CDF
+static double g_cdf_wep[41]  = {};  // [0]=0, [1..40]=CDF
+
+void InitCDFTables() {
+    double surv = 1.0;
+    for (int i = 1; i <= 80; ++i) {
+        double p = (i <= 65) ? 0.008 : (i <= 79) ? 0.058 + (i - 66) * 0.05 : 1.0;
+        g_cdf_char[i] = g_cdf_char[i-1] + surv * p;
         surv *= (1.0 - p);
     }
-    return cum;
-}
-
-// 终末地武器池理论CDF
-//   基础概率 4% (1~39抽)
-//   第40抽100% (硬保底)
-//   注: 武器池无公开的软保底爬坡数据，此处简化处理
-double GetTheoreticalCDF_Wep(int x) {
-    double cum = 0.0, surv = 1.0;
-    for (int i = 1; i <= x; ++i) {
+    surv = 1.0;
+    for (int i = 1; i <= 40; ++i) {
         double p = (i >= 40) ? 1.0 : 0.04;
-        cum += surv * p;
+        g_cdf_wep[i] = g_cdf_wep[i-1] + surv * p;
         surv *= (1.0 - p);
     }
-    return cum;
 }
 
 // -------------------------------------------------------
-// 基于频率表的 K-S 检验 — O(max_pity) 替代 O(NlogN) 排序
+// 基于频率表的 K-S 检验 — O(max_pity), CDF 查表 O(1)
 // -------------------------------------------------------
-double ComputeKS(const std::unordered_map<int, int>& freq, int max_pity, int n, double (*cdf_func)(int)) {
+double ComputeKS(const std::unordered_map<int, int>& freq, int max_pity, int n, const double* cdf_table, int cdf_len) {
     if (n == 0) return 0.0;
     double max_d = 0.0;
     int cum_count = 0;
     for (int x = 1; x <= max_pity; ++x) {
         auto it = freq.find(x);
         int count_x = (it != freq.end()) ? it->second : 0;
-        double f_val = cdf_func(x);
-        // 阶梯函数: 检查跳跃前后两端
+        double f_val = (x < cdf_len) ? cdf_table[x] : 1.0;
         double fn_before = (double)cum_count / n;
         cum_count += count_x;
         double fn_after  = (double)cum_count / n;
@@ -293,9 +285,10 @@ Stats Calculate(const std::vector<Pull>& pulls, bool isWeapon, const std::unorde
             }
         }
         
-        // K-S 检验: O(max_pity) 基于频率表遍历
-        auto cdf_fn = isWeapon ? GetTheoreticalCDF_Wep : GetTheoreticalCDF_Char;
-        s.ks_d_all = ComputeKS(s.freq_all, s.max_pity_all, (int)n_all, cdf_fn);
+        // K-S 检验: O(max_pity), CDF 查表 O(1)
+        const double* cdf_tbl = isWeapon ? g_cdf_wep : g_cdf_char;
+        int cdf_len = isWeapon ? 41 : 81;
+        s.ks_d_all = ComputeKS(s.freq_all, s.max_pity_all, (int)n_all, cdf_tbl, cdf_len);
         double d_crit = 1.36 / std::sqrt((double)n_all);
         s.ks_is_normal = (s.ks_d_all <= d_crit); 
     }
@@ -435,15 +428,22 @@ void DrawKDE(Gdiplus::Graphics& g, Gdiplus::Rect rect, const std::unordered_map<
     max_x = ((max_x / 10) + 1) * 10;
     double bandwidth = 4.0; 
     
+    // KDE 散射法: 对每个 freq entry 向两侧扩散, O(|freq| * spread)
+    // 比原始聚集法 O(max_x * |freq|) 快 ~10x (freq 通常只有 ~10 entry, spread ~32)
     auto calcKDE = [&](const std::unordered_map<int, int>& freqs) {
         std::vector<double> curve(max_x + 1, 0.0);
         int total = 0; for (auto const& [v, c] : freqs) total += c;
         if (total == 0) return curve;
-        for (int x = 1; x <= max_x; x++) {
-            double sum = 0;
-            for (auto const& [v, c] : freqs) { double u = (x - v) / bandwidth; sum += c * std::exp(-0.5 * u * u); }
-            curve[x] = sum / total; 
+        int spread = (int)(4.0 * bandwidth) + 1; // 4σ 截断
+        for (auto const& [v, c] : freqs) {
+            int lo = (std::max)(1, v - spread), hi = (std::min)(max_x, v + spread);
+            for (int x = lo; x <= hi; ++x) {
+                double u = (x - v) / bandwidth;
+                curve[x] += c * std::exp(-0.5 * u * u);
+            }
         }
+        double inv_total = 1.0 / total;
+        for (int x = 1; x <= max_x; ++x) curve[x] *= inv_total;
         return curve;
     };
 
@@ -572,6 +572,40 @@ void DrawHazard(Gdiplus::Graphics& g, Gdiplus::Rect rect, const std::vector<doub
     g.DrawString(L"■ 限定 UP 条件概率", -1, &tickFont, Gdiplus::PointF(legendX, (float)rect.Y + DPIScaleF(35.0f)), &redBrush);
 }
 
+// -------------------------------------------------------
+// 预渲染图表到离屏位图 (仅在数据变化时调用一次)
+// WM_PAINT 只需 BitBlt 这个缓存，拖动/露出时零延迟
+// -------------------------------------------------------
+void RebuildChartCache(HWND hwnd) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    int w = rc.right, h = rc.bottom;
+    if (w <= 0 || h <= 0) return;
+    
+    HDC hdcWnd = GetDC(hwnd);
+    HDC hdcMem = CreateCompatibleDC(hdcWnd);
+    
+    if (g_hChartBmp) DeleteObject(g_hChartBmp);
+    g_hChartBmp = CreateCompatibleBitmap(hdcWnd, w, h);
+    
+    HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, g_hChartBmp);
+    FillRect(hdcMem, &rc, (HBRUSH)(COLOR_WINDOW + 1));
+    
+    {
+        Gdiplus::Graphics g(hdcMem);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        
+        DrawKDE(g, Gdiplus::Rect(DPIScale(20), DPIScale(360), DPIScale(600), DPIScale(250)), statsChar.freq_all, statsChar.freq_up, L"角色期望核密度", 130);
+        DrawHazard(g, Gdiplus::Rect(DPIScale(640), DPIScale(360), DPIScale(600), DPIScale(250)), statsChar.hazard_all, statsChar.hazard_up, L"角色经验风险函数", 130);
+        
+        DrawKDE(g, Gdiplus::Rect(DPIScale(20), DPIScale(615), DPIScale(600), DPIScale(250)), statsWep.freq_all, statsWep.freq_up, L"武器期望核密度", 80);
+        DrawHazard(g, Gdiplus::Rect(DPIScale(640), DPIScale(615), DPIScale(600), DPIScale(250)), statsWep.hazard_all, statsWep.hazard_up, L"武器经验风险函数", 80);
+    }
+    
+    SelectObject(hdcMem, hOld);
+    DeleteDC(hdcMem);
+    ReleaseDC(hwnd, hdcWnd);
+}
+
 static HFONT hFont = NULL;
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -579,49 +613,59 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_CREATE: {
             DragAcceptFiles(hwnd, TRUE);
             // HFONT hFont = CreateFontW(DPIScale(17), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
-            hFont = CreateFontW(DPIScale(17), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
+            hFont = CreateFontW(-DPIScale(13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
 
             HWND hL1 = CreateWindowW(L"STATIC", L"支持\x201C限定角色卡池:当期UP角色\x201D映射。未包含的限定角色卡池将仅排查常驻六星角色名单。", WS_CHILD | WS_VISIBLE, DPIScale(20), DPIScale(15), DPIScale(1000), DPIScale(20), hwnd, NULL, NULL, NULL);
             HWND hL_Char = CreateWindowW(L"STATIC", L"常驻六星角色:", WS_CHILD | WS_VISIBLE, DPIScale(20), DPIScale(45), DPIScale(95), DPIScale(20), hwnd, NULL, NULL, NULL);
-            hCharEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"骏卫,黎风,别礼,余烬,艾尔黛拉", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, DPIScale(120), DPIScale(40), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
+            hCharEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W", L"骏卫,黎风,别礼,余烬,艾尔黛拉", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, DPIScale(120), DPIScale(40), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
             HWND hL_PoolMap = CreateWindowW(L"STATIC", L"当期UP角色:", WS_CHILD | WS_VISIBLE, DPIScale(20), DPIScale(75), DPIScale(95), DPIScale(20), hwnd, NULL, NULL, NULL);
-            hPoolMapEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"熔火灼痕:莱万汀,轻飘飘的信使:洁尔佩塔,热烈色彩:伊冯,河流的女儿:汤汤,狼珀:洛茜", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, DPIScale(120), DPIScale(70), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
+            hPoolMapEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W", L"熔火灼痕:莱万汀,轻飘飘的信使:洁尔佩塔,热烈色彩:伊冯,河流的女儿:汤汤,狼珀:洛茜", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, DPIScale(120), DPIScale(70), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
             HWND hL_Wep = CreateWindowW(L"STATIC", L"常驻六星武器:", WS_CHILD | WS_VISIBLE, DPIScale(20), DPIScale(105), DPIScale(95), DPIScale(20), hwnd, NULL, NULL, NULL);
-            hWepEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"宏愿,不知归,黯色火炬,扶摇,热熔切割器,显赫声名,白夜新星,大雷斑,赫拉芬格,典范,昔日精品,破碎君王,J.E.T.,骁勇,负山,同类相食,楔子,领航者,骑士精神,遗忘,爆破单元,作品：蚀迹,沧溟星梦,光荣记忆,望乡", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, DPIScale(120), DPIScale(100), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
+            hWepEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W", L"宏愿,不知归,黯色火炬,扶摇,热熔切割器,显赫声名,白夜新星,大雷斑,赫拉芬格,典范,昔日精品,破碎君王,J.E.T.,骁勇,负山,同类相食,楔子,领航者,骑士精神,遗忘,爆破单元,作品：蚀迹,沧溟星梦,光荣记忆,望乡", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, DPIScale(120), DPIScale(100), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
 
-            hOutEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"等待拖入文件...", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL, DPIScale(20), DPIScale(135), DPIScale(1220), DPIScale(160), hwnd, NULL, NULL, NULL);
+            hOutEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W", L"等待拖入文件...", WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL, DPIScale(20), DPIScale(135), DPIScale(1220), DPIScale(215), hwnd, NULL, NULL, NULL);
             
-            DWORD tabStops[] = { 220 }; 
+            DWORD tabStops[] = { 200 }; 
             SendMessage(hOutEdit, EM_SETTABSTOPS, 1, (LPARAM)tabStops);
+            SendMessage(hOutEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)GetSysColor(COLOR_3DFACE));
 
             SendMessage(hL1, WM_SETFONT, (WPARAM)hFont, TRUE); SendMessage(hL_Char, WM_SETFONT, (WPARAM)hFont, TRUE); SendMessage(hCharEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
             SendMessage(hL_PoolMap, WM_SETFONT, (WPARAM)hFont, TRUE); SendMessage(hPoolMapEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
             SendMessage(hL_Wep, WM_SETFONT, (WPARAM)hFont, TRUE); SendMessage(hWepEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
             SendMessage(hOutEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+            RebuildChartCache(hwnd); // 初始化空图表缓存
             break;
         }
         case WM_DROPFILES: {
             HDROP hDrop = (HDROP)wParam; wchar_t filePath[MAX_PATH];
             DragQueryFileW(hDrop, 0, filePath, MAX_PATH); DragFinish(hDrop);
-            ProcessFile(filePath); InvalidateRect(hwnd, NULL, TRUE);
+            ProcessFile(filePath); 
+            RebuildChartCache(hwnd);     // 数据变化时重建图表缓存
+            InvalidateRect(hwnd, NULL, FALSE); // FALSE = 不擦除背景
             break;
         }
         case WM_PAINT: {
             PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
-            Gdiplus::Graphics g(hdc); g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-            
-            DrawKDE(g, Gdiplus::Rect(DPIScale(20), DPIScale(305), DPIScale(600), DPIScale(250)), statsChar.freq_all, statsChar.freq_up, L"角色期望核密度", 130);
-            DrawHazard(g, Gdiplus::Rect(DPIScale(640), DPIScale(305), DPIScale(600), DPIScale(250)), statsChar.hazard_all, statsChar.hazard_up, L"角色经验风险函数", 130);
-            
-            DrawKDE(g, Gdiplus::Rect(DPIScale(20), DPIScale(565), DPIScale(600), DPIScale(250)), statsWep.freq_all, statsWep.freq_up, L"武器期望核密度", 80);
-            DrawHazard(g, Gdiplus::Rect(DPIScale(640), DPIScale(565), DPIScale(600), DPIScale(250)), statsWep.hazard_all, statsWep.hazard_up, L"武器经验风险函数", 80);
-            
+            if (g_hChartBmp) {
+                // 从预渲染缓存 BitBlt, 零计算零延迟
+                HDC hdcMem = CreateCompatibleDC(hdc);
+                HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, g_hChartBmp);
+                BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top,
+                       ps.rcPaint.right - ps.rcPaint.left,
+                       ps.rcPaint.bottom - ps.rcPaint.top,
+                       hdcMem, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+                SelectObject(hdcMem, hOld);
+                DeleteDC(hdcMem);
+            }
             EndPaint(hwnd, &ps);
             break;
         }
         // case WM_DESTROY: PostQuitMessage(0); break;
+        case WM_ERASEBKGND:
+            return 1; // 跳过背景擦除, 消灭闪烁
         case WM_DESTROY: {
-            if (hFont) DeleteObject(hFont); // <--- 清理 GDI 资源
+            if (g_hChartBmp) { DeleteObject(g_hChartBmp); g_hChartBmp = NULL; }
+            if (hFont) DeleteObject(hFont);
             PostQuitMessage(0); 
             break;
         }
@@ -630,17 +674,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+    LoadLibrary(L"Msftedit.dll");
+
     SetProcessDPIAware(); 
     HDC hdcScreen = GetDC(NULL); g_dpi = GetDeviceCaps(hdcScreen, LOGPIXELSX); ReleaseDC(NULL, hdcScreen);
 
     ULONG_PTR gdiplusToken; Gdiplus::GdiplusStartupInput gdiplusStartupInput;
     Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+    InitCDFTables(); // 预计算理论 CDF 查找表
 
     WNDCLASSW wc = {0}; wc.lpfnWndProc = WndProc; wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = L"EndfieldStatsClass"; RegisterClassW(&wc);
 
-    DWORD dwStyle = WS_OVERLAPPEDWINDOW ^ WS_THICKFRAME ^ WS_MAXIMIZEBOX;
+    DWORD dwStyle = (WS_OVERLAPPEDWINDOW ^ WS_THICKFRAME ^ WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
     RECT rect = { 0, 0, DPIScale(1280), DPIScale(880) };
     AdjustWindowRectEx(&rect, dwStyle, FALSE, 0);
 
