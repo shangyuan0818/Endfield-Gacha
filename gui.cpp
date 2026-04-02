@@ -688,7 +688,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     wc.lpszClassName = L"EndfieldStatsClass"; RegisterClassW(&wc);
 
     DWORD dwStyle = (WS_OVERLAPPEDWINDOW ^ WS_THICKFRAME ^ WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
-    RECT rect = { 0, 0, DPIScale(1280), DPIScale(880) };
+    // RECT rect = { 0, 0, DPIScale(1280), DPIScale(930) };
+    RECT rect = { 0, 0, DPIScale(1280), DPIScale(900) };
     AdjustWindowRectEx(&rect, dwStyle, FALSE, 0);
 
     int windowWidth = rect.right - rect.left;
