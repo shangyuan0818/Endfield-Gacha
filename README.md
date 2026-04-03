@@ -42,7 +42,7 @@ System 系统: Windows 10 or higher 视窗10或更高
 
 Minimum System 最低系统: Windows 7 SP1 with installed Microsoft Visual C++ Redistributable. https://visualstudio.microsoft.com/downloads/#microsoft-visual-c-v14-redistributable
 
-CPU 处理器: i386 and amd64 (x86 and x64) 32位和64位
+CPU 处理器: x86, x86_x64 and arm64 (32-bit and 64-bit) 32位和64位
 
 For macOS, please check https://github.com/shangyuan0818/Endfield-Gacha-macOS
 
