@@ -42,6 +42,10 @@ System 系统: Windows 10 or higher 视窗10或更高
 
 CPU 处理器: i386 and amd64 (x86 and x64) 32位和64位
 
+For macOS, please check https://github.com/shangyuan0818/Endfield-Gacha-macOS
+
+macOS用户请看 https://github.com/shangyuan0818/Endfield-Gacha-macOS
+
 
 
 # Demostrate 效果展示
