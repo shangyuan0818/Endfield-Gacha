@@ -371,10 +371,11 @@ int main() {
 
     std::string uigfFilename = "uigf_endfield.json";
 
-    // ---- 读取本地老记录 ----
+    // ---- 读取本地老记录(读完立即释放句柄,避免锁住目标文件)----
     {
         FileHandle hFile;
-        hFile.h = CreateFileA(uigfFilename.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        hFile.h = CreateFileA(uigfFilename.c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile.h != INVALID_HANDLE_VALUE) {
             DWORD fileSize = GetFileSize(hFile, NULL);
@@ -385,16 +386,16 @@ int main() {
                     MapView view;
                     view.p = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
                     if (view.p) {
-                        // 老记录的 string_view 指向 mmap 区域,必须在全程序生命周期内有效。
-                        // 故把句柄 transfer 到 static,等 OS 在进程退出时回收。
-                        static HANDLE s_hFile = INVALID_HANDLE_VALUE;
-                        static HANDLE s_hMap = NULL;
-                        static const void* s_mapData = nullptr;
-                        s_hFile = hFile.h; hFile.h = INVALID_HANDLE_VALUE;
-                        s_hMap  = hMap.h;  hMap.h  = NULL;
-                        s_mapData = view.p; view.p = nullptr;
+                        // 关键修复:把 mmap 数据复制到 networkPayloads,让 string_view
+                        // 指向 deque 里的 string(deque push_back 不失效指针)。
+                        // 这样就可以立即关闭 mmap/file 句柄,不会锁住目标文件导致
+                        // 后续 MoveFileExA 失败。
+                        networkPayloads.emplace_back(
+                            std::string((const char*)view.p, fileSize));
+                        std::string_view bufferView = networkPayloads.back();
 
-                        std::string_view bufferView((const char*)s_mapData, fileSize);
+                        // RAII Guard 会在退出本作用域时自动 unmap / close
+
                         if (bufferView.size() >= 3 &&
                             (unsigned char)bufferView[0] == 0xEF &&
                             (unsigned char)bufferView[1] == 0xBB &&
@@ -437,7 +438,7 @@ int main() {
         } else {
             printf("未发现本地记录,将创建新文件。\n");
         }
-    }
+    }  // <- Guard 全部析构,文件完全释放
 
     std::wstring hostName = L"ef-webview.gryphline.com";
     if (inputUrl.find("hypergryph") != std::string_view::npos) {
