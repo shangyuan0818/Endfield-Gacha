@@ -9,8 +9,6 @@ cl /O1 /GL /MD /EHsc /std:c++20 /utf-8 main.cpp winhttp.lib /link /OPT:REF /OPT:
 
 For GUI only:
 
-cl /EHsc /std:c++20 /utf-8 /DUNICODE /D_UNICODE gui.cpp user32.lib gdi32.lib shell32.lib /link /SUBSYSTEM:WINDOWS
+cl /O2 /GL /EHsc /std:c++20 /utf-8 /DUNICODE /D_UNICODE /MT gui.cpp user32.lib gdi32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG /STACK:4194304
 
-cl /O1 /GL /EHsc /std:c++20 /utf-8 /DUNICODE /D_UNICODE gui.cpp user32.lib gdi32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG
-
-cl /O1 /GL /MD /EHsc /std:c++20 /utf-8 /DUNICODE /D_UNICODE gui.cpp user32.lib gdi32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG
+cl /O2 /GL /EHsc /std:c++20 /utf-8 /DUNICODE /D_UNICODE /arch:AVX2 gui.cpp user32.lib gdi32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG /STACK:4194304
