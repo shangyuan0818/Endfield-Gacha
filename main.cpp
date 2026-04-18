@@ -468,7 +468,7 @@ int main() {
         w.Write("        \"export_timestamp\": "); 
         auto [ptr, ec] = std::to_chars(numBuf, numBuf + 32, export_ts);
         w.Write(numBuf, (DWORD)(ptr - numBuf)); w.Write(",\n");
-        w.Write("        \"export_app\": \"Endfield Exporter\",\n        \"export_app_version\": \"v2.4.0 (DoD Core)\",\n        \"uigf_version\": \"v3.0\"\n    },\n");
+        w.Write("        \"export_app\": \"Endfield Exporter\",\n        \"export_app_version\": \"v2.4.0\",\n        \"uigf_version\": \"v3.0\"\n    },\n");
         w.Write("    \"list\": [\n");
 
         for (size_t i = 0; i < indices.size(); ++i) {
