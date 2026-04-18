@@ -619,7 +619,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HWND hL_Char = CreateWindowW(L"STATIC", L"常驻六星角色:", WS_CHILD | WS_VISIBLE, DPIScale(20), DPIScale(45), DPIScale(95), DPIScale(20), hwnd, NULL, NULL, NULL);
             hCharEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W", L"骏卫,黎风,别礼,余烬,艾尔黛拉", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, DPIScale(120), DPIScale(40), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
             HWND hL_PoolMap = CreateWindowW(L"STATIC", L"当期UP角色:", WS_CHILD | WS_VISIBLE, DPIScale(20), DPIScale(75), DPIScale(95), DPIScale(20), hwnd, NULL, NULL, NULL);
-            hPoolMapEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W", L"熔火灼痕:莱万汀,轻飘飘的信使:洁尔佩塔,热烈色彩:伊冯,河流的女儿:汤汤,狼珀:洛茜", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, DPIScale(120), DPIScale(70), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
+            hPoolMapEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W", L"熔火灼痕:莱万汀,轻飘飘的信使:洁尔佩塔,热烈色彩:伊冯,河流的女儿:汤汤,狼珀:洛茜,春雷动，万物生:庄方宜", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, DPIScale(120), DPIScale(70), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
             HWND hL_Wep = CreateWindowW(L"STATIC", L"常驻六星武器:", WS_CHILD | WS_VISIBLE, DPIScale(20), DPIScale(105), DPIScale(95), DPIScale(20), hwnd, NULL, NULL, NULL);
             hWepEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W", L"宏愿,不知归,黯色火炬,扶摇,热熔切割器,显赫声名,白夜新星,大雷斑,赫拉芬格,典范,昔日精品,破碎君王,J.E.T.,骁勇,负山,同类相食,楔子,领航者,骑士精神,遗忘,爆破单元,作品：蚀迹,沧溟星梦,光荣记忆,望乡", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, DPIScale(120), DPIScale(100), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
 
