@@ -6,50 +6,31 @@ Gacha tracker and visualizer for Arknights: Endfield. Built with C++20 &amp; Win
 
 
 # How to use 如何使用
-Run main.exe (the exporter) and input your gacha link.
-
-运行用于保存抽卡数据的main.exe主程序并输入你的抽卡链接。
-
-You can get the uigf_endfield.json gacha data saved by main.exe in running directory.
-
-你可以在运行目录中找到main.exe程序保存的uigf_endfield.json文件。
-
-Run gui.exe (the analyzer) and drag uigf_endfield.json onto the window.
-
-运行用于分析与可视化抽卡数据的gui.exe图形界面程序并拖拽uigf_endfield.json到程序窗口。
-
+1. Run `main.exe` (the exporter) and input your gacha link.
+   运行用于保存抽卡数据的 `main.exe` 主程序，并输入你的抽卡链接。
+2. You can find the `uigf_endfield.json` gacha data saved by `main.exe` in the current running directory.
+   你可以在运行目录中找到 `main.exe` 程序保存的 `uigf_endfield.json` 文件。
+3. Run `gui.exe` (the analyzer) and drag `uigf_endfield.json` onto the window.
+   运行用于分析与可视化抽卡数据的 `gui.exe` 图形界面程序，并将 `uigf_endfield.json` 拖拽到程序窗口中。
 
 
 # How to compile 如何编译
-Download and install "Build Tools for Visual Studio 2026" 
-
-下载并安装Visual Studio 2026 生成工具
-
-https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2026
-
-Go to Compile.txt, copy the command and paste into "x64 Native Tools Command Prompt for VS" application. 
-
-打开Compile.txt，把命令复制粘贴到x64 Native Tools Command Prompt for VS应用。 
-
-Press enter to run the command
-
-按下回车来运行命令
-
+1. Download and install [Build Tools for Visual Studio 2026](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2026).
+   下载并安装 Visual Studio 2026 生成工具。
+2. Open the **"x64 Native Tools Command Prompt for VS"** application.
+   打开 **"x64 Native Tools Command Prompt for VS"** 应用。
+3. Copy the command from `Compile.txt` and paste it into the command prompt, then press Enter to run.
+   打开 `Compile.txt`，把命令复制粘贴到命令行应用中，按下回车运行。
 
 
 # Compatibility 兼容性
-System 系统: Windows 10 or higher 视窗10或更高
+* **System 系统**: Windows 10 or higher (视窗 10 或更高版本)
+* **Minimum System 最低系统**: Windows 7 SP1 with installed [Microsoft Visual C++ Redistributable](https://visualstudio.microsoft.com/downloads/#microsoft-visual-c-v14-redistributable).
+* **CPU 处理器**: x86, x86_64, and arm64 (32-bit and 64-bit / 32位和64位)
 
-Minimum System 最低系统: Windows 7 SP1 with installed Microsoft Visual C++ Redistributable. https://visualstudio.microsoft.com/downloads/#microsoft-visual-c-v14-redistributable
+> **macOS Users:**
+> Please check the macOS SwiftUI version here: [Endfield-Gacha-macOS](https://github.com/shangyuan0818/Endfield-Gacha-macOS)
 
-CPU 处理器: x86, x86_x64 and arm64 (32-bit and 64-bit) 32位和64位
-
-For macOS, please check https://github.com/shangyuan0818/Endfield-Gacha-macOS
-
-macOS用户请看 https://github.com/shangyuan0818/Endfield-Gacha-macOS
-
-
-
-# Demostrate 效果展示
-<img width="1920" height="1350" alt="image" src="https://github.com/user-attachments/assets/039fea96-0430-4da7-a6c8-0a08d7c5da9a" />
+# Demonstration 效果展示
+<img width="1920" height="1350" alt="image" src="https://github.com/user-attachments/assets/46ab7f44-058e-4b39-a3a3-5179a1daf901" />
 
