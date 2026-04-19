@@ -455,7 +455,8 @@ void ProcessFile(const std::wstring& path) {
         bufferView.remove_prefix(3);
     }
 
-    std::array<std::byte, 1024 * 1024> stackBuffer;
+    // PMR:栈上 2MB 内存池
+    std::array<std::byte, 2 * 1024 * 1024> stackBuffer;
     std::pmr::monotonic_buffer_resource pool(stackBuffer.data(), stackBuffer.size());
     std::pmr::polymorphic_allocator<std::byte> alloc(&pool);
 
