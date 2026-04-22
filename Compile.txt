@@ -1,13 +1,13 @@
 For exporter:
 
-cl /O2 /GL /EHsc /std:c++20 /utf-8 /DUNICODE /D_UNICODE /MT main.cpp user32.lib winhttp.lib /link /SUBSYSTEM:CONSOLE /OPT:REF /OPT:ICF /LTCG /STACK:4194304
+cl /O2 /GL /EHsc /std:c++20 /utf-8 /DUNICODE /D_UNICODE /MT main.cpp user32.lib winhttp.lib /link /SUBSYSTEM:CONSOLE /OPT:REF /OPT:ICF /LTCG
 
 
 For GUI:
 
-cl /O2 /GL /EHsc /std:c++20 /utf-8 /DUNICODE /D_UNICODE /MT gui.cpp user32.lib gdi32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG /STACK:4194304
+cl /O2 /GL /EHsc /std:c++20 /utf-8 /DUNICODE /D_UNICODE /MT gui.cpp user32.lib gdi32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG
 
 
 For GUI with enabled AVX2:
 
-cl /O2 /GL /EHsc /std:c++20 /utf-8 /DUNICODE /D_UNICODE /MT /arch:AVX2 gui.cpp user32.lib gdi32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG /STACK:4194304
+cl /O2 /GL /EHsc /std:c++20 /utf-8 /DUNICODE /D_UNICODE /MT /arch:AVX2 gui.cpp user32.lib gdi32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG
