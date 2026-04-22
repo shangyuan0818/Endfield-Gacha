@@ -1,5 +1,5 @@
 // ============================================================
-// Endfield Gacha Exporter - UIGF v3.0 / 面向数据 / PMR 静态堆缓冲
+// Endfield Gacha Exporter - UIGF v3.0 / 面向数据 / PMR 栈分配
 // ============================================================
 #include <cstdio>
 #include <cstdlib>
@@ -238,14 +238,13 @@ struct PoolConfig { std::string poolType, displayName; bool isWeapon; };
 
 // ---------------------------------------------------------
 // [BufferedWriter - 析构 RAII Flush]
-// 优化: 64KB 缓冲区移至堆分配，避免撑爆栈帧导致 L1d 命中率下降
 // ---------------------------------------------------------
 struct BufferedWriter {
     HANDLE hFile;
-    std::vector<char> buf;
+    char buf[65536];
     DWORD pos = 0;
 
-    explicit BufferedWriter(HANDLE h) : hFile(h), buf(65536) {}
+    explicit BufferedWriter(HANDLE h) : hFile(h) {}
     ~BufferedWriter() { Flush(); }
 
     BufferedWriter(const BufferedWriter&) = delete;
@@ -254,17 +253,17 @@ struct BufferedWriter {
     void Flush() {
         if (pos > 0 && hFile != INVALID_HANDLE_VALUE) {
             DWORD written;
-            WriteFile(hFile, buf.data(), pos, &written, NULL);
+            WriteFile(hFile, buf, pos, &written, NULL);
             pos = 0;
         }
     }
     void Write(const char* data, DWORD len) {
         while (len > 0) {
-            DWORD space = (DWORD)buf.size() - pos;
+            DWORD space = sizeof(buf) - pos;
             DWORD chunk = (len < space) ? len : space;
-            std::memcpy(buf.data() + pos, data, chunk);
+            std::memcpy(buf + pos, data, chunk);
             pos += chunk; data += chunk; len -= chunk;
-            if (pos == (DWORD)buf.size()) Flush();
+            if (pos == sizeof(buf)) Flush();
         }
     }
     void Write(std::string_view sv) { Write(sv.data(), (DWORD)sv.size()); }
@@ -272,8 +271,8 @@ struct BufferedWriter {
     template<size_t N>
     void WriteLit(const char (&s)[N]) {
         constexpr DWORD len = N - 1;
-        if (pos + len > (DWORD)buf.size()) Flush();
-        std::memcpy(buf.data() + pos, s, len);
+        if (pos + len > sizeof(buf)) Flush();
+        std::memcpy(buf + pos, s, len);
         pos += len;
     }
 
@@ -355,12 +354,9 @@ int main() {
         {"",                                   "武器 - 全历史记录", true}
     };
 
-    // ========================================================
-    // 【核心优化】静态堆分配内存池，完美适配 L1-L3 Cache
-    // 原注释: PMR:栈上 2MB 池 (现已改为堆分配)
-    // ========================================================
-    static std::vector<std::byte> heapBuffer(2 * 1024 * 1024);
-    std::pmr::monotonic_buffer_resource pool(heapBuffer.data(), heapBuffer.size());
+    // PMR:栈上 2MB 池
+    std::array<std::byte, 2 * 1024 * 1024> stackBuffer;
+    std::pmr::monotonic_buffer_resource pool(stackBuffer.data(), stackBuffer.size());
     std::pmr::polymorphic_allocator<std::byte> alloc(&pool);
 
     // AoS 记录
