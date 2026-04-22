@@ -32,5 +32,4 @@ Gacha tracker and visualizer for Arknights: Endfield. Built with C++20 &amp; Win
 > Please check the macOS SwiftUI version here: [Endfield-Gacha-macOS](https://github.com/shangyuan0818/Endfield-Gacha-macOS)
 
 # Demonstration 效果展示
-<img width="1920" height="1350" alt="image" src="https://github.com/user-attachments/assets/46ab7f44-058e-4b39-a3a3-5179a1daf901" />
-
+<img width="1920" height="1350" alt="image" src="https://github.com/user-attachments/assets/3ce5b613-8b52-4d48-b5c7-6afc2da7934d" />
