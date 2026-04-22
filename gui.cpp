@@ -623,15 +623,19 @@ struct ViewGuard {
 // ---------------------------------------------------------
 // 文件处理
 // ---------------------------------------------------------
+// 辅助函数：安全读取动态长度的 Edit 控件文本
+std::wstring GetDynamicWindowText(HWND hwnd) {
+    int len = GetWindowTextLengthW(hwnd);
+    if (len == 0) return L"";
+    std::wstring buf(len, L'\0');
+    GetWindowTextW(hwnd, buf.data(), len + 1);
+    return buf;
+}
+
 void ProcessFile(const std::wstring& path) {
-    wchar_t charBuf[1024]; GetWindowTextW(hCharEdit, charBuf, 1024);
-    auto stdChars = ParseCommaSeparatedUtf8(charBuf);
-
-    wchar_t poolBuf[4096]; GetWindowTextW(hPoolMapEdit, poolBuf, 4096);
-    auto poolMap = ParsePoolMapUtf8(poolBuf);
-
-    wchar_t wepBuf[4096]; GetWindowTextW(hWepEdit, wepBuf, 4096);
-    auto stdWeps = ParseCommaSeparatedUtf8(wepBuf);
+    auto stdChars = ParseCommaSeparatedUtf8(GetDynamicWindowText(hCharEdit));
+    auto poolMap  = ParsePoolMapUtf8(GetDynamicWindowText(hPoolMapEdit));
+    auto stdWeps  = ParseCommaSeparatedUtf8(GetDynamicWindowText(hWepEdit));
 
     FileGuard hFile;
     hFile.h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
@@ -657,9 +661,13 @@ void ProcessFile(const std::wstring& path) {
         bufferView.remove_prefix(3);
     }
 
-    // PMR:栈上 2MB 内存池
-    std::array<std::byte, 2 * 1024 * 1024> stackBuffer;
-    std::pmr::monotonic_buffer_resource pool(stackBuffer.data(), stackBuffer.size());
+    // ========================================================
+    // 【核心优化】静态堆分配内存池，完美适配 L1-L3 Cache
+    // 采用 static 保证整个程序生命周期只申请一次 2MB 堆内存，
+    // 消除了栈上分配带来的 _chkstk 探针开销，同时保持物理连续。
+    // ========================================================
+    static std::vector<std::byte> heapBuffer(2 * 1024 * 1024);
+    std::pmr::monotonic_buffer_resource pool(heapBuffer.data(), heapBuffer.size());
     std::pmr::polymorphic_allocator<std::byte> alloc(&pool);
 
     // temps:先收集排序所需的最小字段,再分发到两个桶
