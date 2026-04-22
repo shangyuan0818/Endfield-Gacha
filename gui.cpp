@@ -623,18 +623,21 @@ struct ViewGuard {
 // ---------------------------------------------------------
 // 文件处理
 // ---------------------------------------------------------
-// 辅助函数：安全读取动态长度的 Edit 控件文本
-std::wstring GetDynamicWindowText(HWND hwnd) {
+// 安全读取动态长度的 Edit 控件文本
+// 原版固定 wchar_t[4096] 在用户粘贴超长 UP 映射文本时会被 GetWindowTextW 截断,
+// 下游 ParsePoolMapUtf8 看到的是不完整数据 → 丢映射。
+// 先 GetWindowTextLengthW 查长度再按需分配,彻底消除截断风险
+inline std::wstring GetDynamicWindowText(HWND hwnd) {
     int len = GetWindowTextLengthW(hwnd);
-    if (len == 0) return L"";
-    std::wstring buf(len, L'\0');
-    GetWindowTextW(hwnd, buf.data(), len + 1);
+    if (len <= 0) return L"";
+    std::wstring buf((size_t)len, L'\0');
+    GetWindowTextW(hwnd, buf.data(), len + 1);  // GetWindowTextW 需要 len+1 容纳末尾 '\0'
     return buf;
 }
 
 void ProcessFile(const std::wstring& path) {
     auto stdChars = ParseCommaSeparatedUtf8(GetDynamicWindowText(hCharEdit));
-    auto poolMap  = ParsePoolMapUtf8(GetDynamicWindowText(hPoolMapEdit));
+    auto poolMap  = ParsePoolMapUtf8       (GetDynamicWindowText(hPoolMapEdit));
     auto stdWeps  = ParseCommaSeparatedUtf8(GetDynamicWindowText(hWepEdit));
 
     FileGuard hFile;
@@ -661,13 +664,9 @@ void ProcessFile(const std::wstring& path) {
         bufferView.remove_prefix(3);
     }
 
-    // ========================================================
-    // 【核心优化】静态堆分配内存池，完美适配 L1-L3 Cache
-    // 采用 static 保证整个程序生命周期只申请一次 2MB 堆内存，
-    // 消除了栈上分配带来的 _chkstk 探针开销，同时保持物理连续。
-    // ========================================================
-    static std::vector<std::byte> heapBuffer(2 * 1024 * 1024);
-    std::pmr::monotonic_buffer_resource pool(heapBuffer.data(), heapBuffer.size());
+    // PMR:栈上 2MB 内存池
+    std::array<std::byte, 2 * 1024 * 1024> stackBuffer;
+    std::pmr::monotonic_buffer_resource pool(stackBuffer.data(), stackBuffer.size());
     std::pmr::polymorphic_allocator<std::byte> alloc(&pool);
 
     // temps:先收集排序所需的最小字段,再分发到两个桶
@@ -1157,7 +1156,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL,
             DPIScale(20), DPIScale(135), DPIScale(1220), DPIScale(215), hwnd, NULL, NULL, NULL);
 
-        DWORD tabStops[] = {50};
+        DWORD tabStops[] = {200};
         SendMessage(hOutEdit, EM_SETTABSTOPS, 1, (LPARAM)tabStops);
         SendMessage(hOutEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)GetSysColor(COLOR_3DFACE));
 
