@@ -169,11 +169,15 @@ inline std::string WideToUtf8(std::wstring_view wstr) {
     return result;
 }
 
+// 注意:UP 映射文本中故意只识别 ASCII ',' 和 ':' 作为分隔符。
+// 全角逗号 '，'(U+FF0C) 与全角冒号 '：'(U+FF1A) 不视为分隔符 —— 因为合法的
+// 池名本身可能含有全角逗号(如 "春雷动，万物生")。把全角逗号当分隔符会导致
+// 该池的 UP 映射被切碎,UP 识别全部失效(用户输入法切换的便利不值这个代价)。
 std::unordered_set<std::string, StringHash, std::equal_to<>> ParseCommaSeparatedUtf8(const std::wstring& text) {
     std::unordered_set<std::string, StringHash, std::equal_to<>> result;
     std::wstring cur;
     for (wchar_t c : text) {
-        if (c == L',' || c == L'\uFF0C') {
+        if (c == L',') {
             cur.erase(0, cur.find_first_not_of(L" \t\r\n"));
             if (!cur.empty()) cur.erase(cur.find_last_not_of(L" \t\r\n") + 1);
             if (!cur.empty()) result.insert(WideToUtf8(cur));
@@ -191,11 +195,11 @@ std::unordered_map<std::string, std::string, StringHash, std::equal_to<>> ParseP
     std::wstring cur_pool, cur_up, cur;
     bool reading_up = false;
     for (wchar_t c : text) {
-        if ((c == L':' || c == L'\uFF1A') && !reading_up) {
+        if (c == L':' && !reading_up) {
             cur.erase(0, cur.find_first_not_of(L" \t\r\n"));
             cur.erase(cur.find_last_not_of(L" \t\r\n") + 1);
             cur_pool = cur; cur.clear(); reading_up = true;
-        } else if (c == L',' || c == L'\uFF0C') {
+        } else if (c == L',') {
             cur.erase(0, cur.find_first_not_of(L" \t\r\n"));
             cur.erase(cur.find_last_not_of(L" \t\r\n") + 1);
             cur_up = cur;
@@ -225,27 +229,16 @@ inline std::string TrimUtf8(std::string_view sv) {
 }
 
 std::unordered_set<std::string, StringHash, std::equal_to<>> ParseCommaSeparatedUtf8FromUtf8(std::string_view text) {
+    // 与 wchar_t 版同步: 仅识别 ASCII ',' 作为分隔符,不识别全角逗号。
     std::unordered_set<std::string, StringHash, std::equal_to<>> result;
-    // 切分 ASCII 逗号 ',' 和 utf8 全角逗号 ',' (E3 80 81/EF BC 8C)
-    // 实际只考虑 EF BC 8C (FF0C 的 utf8 编码)
     std::string cur;
-    for (size_t i = 0; i < text.size();) {
-        // 检测 EF BC 8C (UTF-8 of U+FF0C)
-        if (i + 2 < text.size()
-            && (uint8_t)text[i]   == 0xEF
-            && (uint8_t)text[i+1] == 0xBC
-            && (uint8_t)text[i+2] == 0x8C) {
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == ',') {
             std::string trimmed = TrimUtf8(cur);
             if (!trimmed.empty()) result.insert(std::move(trimmed));
             cur.clear();
-            i += 3;
-        } else if (text[i] == ',') {
-            std::string trimmed = TrimUtf8(cur);
-            if (!trimmed.empty()) result.insert(std::move(trimmed));
-            cur.clear();
-            ++i;
         } else {
-            cur += text[i++];
+            cur += text[i];
         }
     }
     std::string trimmed = TrimUtf8(cur);
@@ -254,6 +247,8 @@ std::unordered_set<std::string, StringHash, std::equal_to<>> ParseCommaSeparated
 }
 
 std::unordered_map<std::string, std::string, StringHash, std::equal_to<>> ParsePoolMapUtf8FromUtf8(std::string_view text) {
+    // 与 wchar_t 版同步: 仅识别 ASCII ',' 和 ':',不识别全角分隔符。
+    // (合法池名可能含全角逗号如 "春雷动，万物生",识别全角会切碎该池映射)
     std::unordered_map<std::string, std::string, StringHash, std::equal_to<>> result;
     std::string cur, cur_pool;
     bool reading_up = false;
@@ -264,24 +259,13 @@ std::unordered_map<std::string, std::string, StringHash, std::equal_to<>> ParseP
         }
         cur.clear(); cur_pool.clear(); reading_up = false;
     };
-    for (size_t i = 0; i < text.size();) {
-        // ':' (ASCII) 或 ':' (UTF-8 of U+FF1A: EF BC 9A)
-        bool is_colon_full = (i + 2 < text.size()
-                              && (uint8_t)text[i]   == 0xEF
-                              && (uint8_t)text[i+1] == 0xBC
-                              && (uint8_t)text[i+2] == 0x9A);
-        bool is_comma_full = (i + 2 < text.size()
-                              && (uint8_t)text[i]   == 0xEF
-                              && (uint8_t)text[i+1] == 0xBC
-                              && (uint8_t)text[i+2] == 0x8C);
-        if ((text[i] == ':' || is_colon_full) && !reading_up) {
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == ':' && !reading_up) {
             cur_pool = TrimUtf8(cur); cur.clear(); reading_up = true;
-            i += is_colon_full ? 3 : 1;
-        } else if (text[i] == ',' || is_comma_full) {
+        } else if (text[i] == ',') {
             flush_entry();
-            i += is_comma_full ? 3 : 1;
         } else {
-            cur += text[i++];
+            cur += text[i];
         }
     }
     if (reading_up) flush_entry();
@@ -1048,9 +1032,27 @@ void ProcessFile_Consume(HWND hwnd, ProcessOutput* out) {
 // -------------------------------------------------------
 // 图形渲染 —— drawCurve 用栈数组,无堆分配
 // -------------------------------------------------------
-void DrawKDE(Gdiplus::Graphics& g, Gdiplus::Rect rect,
-             const std::array<int, 150>& freq_all, const std::array<int, 150>& freq_up,
-             const std::wstring& title, int limit_base) {
+// ---------------------------------------------------------
+// [ECDF (经验累积分布函数) 图]
+//
+// 设计:
+//   - 离散阶梯线: ECDF(x) = (Σ_{k<=x} freq[k]) / total
+//   - 同时画综合(蓝)和 UP(红)两条经验 ECDF + 两条理论 CDF(虚线)
+//   - 标记 KS 偏离最大处的 D 值竖线(与 ks_d_all 一致,用户可视化检验)
+//   - 右删失处理: ECDF 终点不到 1.0(因为 censored_pity 表示当前未出货)
+//
+// 为什么从 KDE 切换到 ECDF:
+//   抽卡数据是离散整数 pity,样本量极小(n ~10),KDE 的高斯核平滑会引入虚假
+//   连续性,带宽选择对结果影响巨大,在 x=1 等边界处会产生人造凸起。
+//   ECDF 是离散数据的标准非参数显示,无任何参数选择,与 KS 检验直接对应。
+// ---------------------------------------------------------
+void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
+              const std::array<int, 150>& freq_all, const std::array<int, 150>& freq_up,
+              int count_all, int count_up,
+              int censored_all, int censored_up,
+              const double* theory_cdf_all, int theory_cdf_all_len,
+              const double* theory_cdf_up,  int theory_cdf_up_len,
+              const std::wstring& title, int limit_base) {
     Gdiplus::SolidBrush bgBrush(Gdiplus::Color(255, 252, 253, 255));
     g.FillRectangle(&bgBrush, rect);
     Gdiplus::FontFamily fontFamily(L"Microsoft YaHei");
@@ -1061,10 +1063,9 @@ void DrawKDE(Gdiplus::Graphics& g, Gdiplus::Rect rect,
                  &textBrush);
 
     int max_x = limit_base;
-    bool hasData = false;
+    bool hasData = (count_all > 0) || (count_up > 0);
     for (int i = 1; i < 150; i++) {
         if (freq_all[i] > 0 || freq_up[i] > 0) {
-            hasData = true;
             if (i > max_x) max_x = i;
         }
     }
@@ -1079,143 +1080,175 @@ void DrawKDE(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     }
     max_x = ((max_x / 10) + 1) * 10;
 
-    auto calcKDE = [&](const std::array<int, 150>& freqs, std::array<double, 150>& out_curve) {
-        out_curve.fill(0.0);
-        int total = 0;
-        long long sum = 0;
-        long long sum_sq = 0;
-        for (int i = 1; i <= max_x; i++) {
-            total  += freqs[i];
-            sum    += (long long)i * freqs[i];
-            sum_sq += (long long)i * i * freqs[i];
-        }
-        if (total == 0) return;
+    // 网格 + 坐标轴
+    Gdiplus::Pen gridPen(Gdiplus::Color(255, 230, 230, 230), DPIScaleF(1.0f));
+    Gdiplus::Pen axisPen(Gdiplus::Color(255, 80, 80, 80),  DPIScaleF(1.0f));
+    float plotX = (float)rect.X + DPIScaleF(50.0f);
+    float plotY = (float)rect.Y + DPIScaleF(40.0f);
+    float plotW = (float)rect.Width  - DPIScaleF(70.0f);
+    float plotH = (float)rect.Height - DPIScaleF(60.0f);
+    if (plotW <= 0 || plotH <= 0) return;
 
-        // Silverman 经验法则:h = 1.06 · σ · n^(-1/5)
-        // σ 用无偏样本标准差(文献中的 Silverman 带宽公式基于样本 sd,非 MLE)
-        // 回退条件仅防止数值退化(n<5 样本量不足以估计 σ,σ=0 会导致 h=0 除零)
-        double var = SampleVariance(sum, sum_sq, total);
-        double sd  = std::sqrt(var);
-        double bandwidth = (total >= 5 && sd > 0.5)
-                             ? 1.06 * sd * std::pow((double)total, -0.2)
-                             : 4.0;  // 样本不足时的回退值,仅避免数值问题
-
-        int spread = (int)(4.0 * bandwidth) + 1;
-
-        // 第一步:标准高斯核累加(无任何边界假设)
-        for (int v = 1; v <= max_x; ++v) {
-            if (freqs[v] == 0) continue;
-            int lo = (std::max)(1, v - spread);
-            int hi = (std::min)(max_x, v + spread);
-            for (int x = lo; x <= hi; ++x) {
-                double u = (x - v) / bandwidth;
-                out_curve[x] += freqs[v] * std::exp(-0.5 * u * u);
-            }
-        }
-
-        // 第二步:Jones(1993) 边界修正 —— renormalization method
-        //
-        // 问题:真实分布支撑集 ⊂ [1, max_x](角色池硬保底 80、UP 硬保底 120,武器池类似)
-        //       高斯核会向 [−∞, 0] 和 [max_x+1, +∞] 方向"泄漏"概率质量,
-        //       导致 ∫_{[1, max_x]} f_hat(x)dx < 1,边界附近密度被系统性低估
-        //
-        // 反射法(Reflection)会假设"镜像对称",但抽卡分布在 x=30 尖峰、x=66..80
-        //   软保底爬坡处**不对称**,反射会引入虚假结构
-        //
-        // 这里用重新归一化法:不假设对称,只补偿被截断的核质量
-        //   C(x) = 1 / P(x − h·U ∈ [0.5, max_x + 0.5])
-        //        = 1 / [Φ((max_x+0.5 − x)/h) − Φ((0.5 − x)/h)]
-        // (正态 CDF Φ 用 erf 计算,离散 x 把整数 k 理解为 [k−0.5, k+0.5] 的格子中心)
-        constexpr double SQRT_2PI = 2.5066282746310002;
-        constexpr double INV_SQRT2 = 0.7071067811865475;
-        double left_edge  = 0.5;
-        double right_edge = (double)max_x + 0.5;
-        for (int x = 1; x <= max_x; ++x) {
-            // 标准正态 CDF: Φ(z) = 0.5 × (1 + erf(z/√2))
-            double z_right = (right_edge - x) / bandwidth * INV_SQRT2;
-            double z_left  = (left_edge  - x) / bandwidth * INV_SQRT2;
-            double mass = 0.5 * (std::erf(z_right) - std::erf(z_left));
-            if (mass > 1e-12) out_curve[x] /= mass;
-        }
-
-        // 第三步:完整归一化 1 / (n · h · √(2π))
-        //   这一步让"每个数据点贡献"的核 f_v(x) = K((x−v)/h)/(h√(2π)) 满足 ∫ f_v = 1
-        //   配合第二步的边界补偿,最终得到 Σ_{x=1..max_x} f_hat(x) = 1 (离散密度)
-        double inv_norm = 1.0 / ((double)total * bandwidth * SQRT_2PI);
-        for (int x = 1; x <= max_x; ++x) out_curve[x] *= inv_norm;
-    };
-
-    std::array<double, 150> kde_all{}, kde_up{};
-    calcKDE(freq_all, kde_all);
-    calcKDE(freq_up,  kde_up);
-
-    double max_y = 0.0001;
-    for (int i = 1; i <= max_x; i++) {
-        if (kde_all[i] > max_y) max_y = kde_all[i];
-        if (kde_up[i]  > max_y) max_y = kde_up[i];
-    }
-    max_y *= 1.25;
-
-    float plotX = (float)rect.X + DPIScaleF(55.0f), plotY = (float)rect.Y + DPIScaleF(45.0f);
-    float plotW = (float)rect.Width - DPIScaleF(85.0f), plotH = (float)rect.Height - DPIScaleF(75.0f);
-    Gdiplus::Pen axisPen(Gdiplus::Color(255, 150, 150, 150), DPIScaleF(1.5f));
-    Gdiplus::Pen gridPen(Gdiplus::Color(255, 235, 235, 235), DPIScaleF(1.0f));
+    g.DrawLine(&axisPen, plotX, plotY,         plotX, plotY + plotH);
     g.DrawLine(&axisPen, plotX, plotY + plotH, plotX + plotW, plotY + plotH);
-    g.DrawLine(&axisPen, plotX, plotY, plotX, plotY + plotH);
 
-    auto getPt = [&](int x, double y) {
+    auto getPt = [&](int x, double y) -> Gdiplus::PointF {
+        if (y < 0) y = 0; if (y > 1) y = 1;
         return Gdiplus::PointF(plotX + (float)x / (float)max_x * plotW,
-                               plotY + plotH - (float)(y / max_y) * plotH);
+                               plotY + plotH - (float)y * plotH);
     };
+
     Gdiplus::Font tickFont(&fontFamily, DPIScaleF(11.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::SolidBrush tickBrush(Gdiplus::Color(255, 120, 120, 120));
 
+    // Y 轴 0/25/50/75/100% 网格
     for (int i = 0; i <= 4; ++i) {
-        float py = plotY + plotH - (float)i / 4.0f * plotH;
+        double y_val = (double)i / 4.0;
+        float py = plotY + plotH - (float)y_val * plotH;
         if (i > 0) g.DrawLine(&gridPen, plotX, py, plotX + plotW, py);
         g.DrawLine(&axisPen, plotX - DPIScaleF(5.0f), py, plotX, py);
-        wchar_t y_label[32]; swprintf(y_label, 32, L"%.1f%%", (max_y / 4.0) * i * 100.0);
+        wchar_t y_label[16]; swprintf(y_label, 16, L"%d%%", i * 25);
         float labelW = (float)wcslen(y_label) * DPIScaleF(5.5f) + DPIScaleF(8.0f);
         g.DrawString(y_label, -1, &tickFont, Gdiplus::PointF(plotX - labelW, py - DPIScaleF(6.0f)), &tickBrush);
     }
+    // X 轴刻度
     int step = (max_x > 140) ? 20 : 10;
     for (int x = 0; x <= max_x; x += step) {
         float px = plotX + (float)x / (float)max_x * plotW;
         g.DrawLine(&axisPen, px, plotY + plotH, px, plotY + plotH + DPIScaleF(5.0f));
         wchar_t x_label[16]; swprintf(x_label, 16, L"%d", x);
         float xoff = (x < 10 ? 4.0f : x < 100 ? 8.0f : 12.0f) * DPIScaleF(1.0f);
-        g.DrawString(x_label, -1, &tickFont, Gdiplus::PointF(px - xoff, plotY + plotH + DPIScaleF(8.0f)), &tickBrush);
+        g.DrawString(x_label, -1, &tickFont,
+                     Gdiplus::PointF(px - xoff, plotY + plotH + DPIScaleF(8.0f)), &tickBrush);
     }
 
-    // 栈数组 —— max_x 最大 <150
-    auto drawCurve = [&](const std::array<double, 150>& kde, Gdiplus::Color color) {
-        std::array<Gdiplus::PointF, 151> pts;
-        pts[0] = getPt(0, 0);
-        int ptsCount = 1;
-        for (int x = 1; x <= max_x && ptsCount < (int)pts.size(); ++x) {
-            pts[ptsCount++] = getPt(x, kde[x]);
+    // 画理论 CDF (虚线): 实线步进 (k-1, F(k-1)) -> (k, F(k-1)) -> (k, F(k))
+    auto drawTheoryCDF = [&](const double* cdf, int cdf_len, Gdiplus::Color color) {
+        if (!cdf || cdf_len < 2) return;
+        Gdiplus::Pen pen(color, DPIScaleF(1.5f));
+        Gdiplus::REAL dash[2] = { DPIScaleF(4.0f), DPIScaleF(3.0f) };
+        pen.SetDashPattern(dash, 2);
+        int upper = (cdf_len - 1 < max_x) ? cdf_len - 1 : max_x;
+        for (int k = 1; k <= upper; ++k) {
+            double f_prev = cdf[k-1];
+            double f_curr = cdf[k];
+            // 水平段: (k-1, F(k-1)) -> (k, F(k-1))
+            auto p1 = getPt(k-1, f_prev), p2 = getPt(k, f_prev);
+            g.DrawLine(&pen, p1.X, p1.Y, p2.X, p2.Y);
+            // 垂直段: (k, F(k-1)) -> (k, F(k))
+            auto p3 = getPt(k, f_curr);
+            g.DrawLine(&pen, p2.X, p2.Y, p3.X, p3.Y);
         }
-        Gdiplus::Pen pen(color, DPIScaleF(2.5f));
-        g.DrawCurve(&pen, pts.data(), ptsCount, 0.3f);
     };
 
-    drawCurve(kde_all, Gdiplus::Color(255, 65, 140, 240));
-    drawCurve(kde_up,  Gdiplus::Color(255, 240, 80, 80));
+    // 画经验 ECDF (实阶梯线). 右删失观测计入分母:
+    //   ECDF(x) = (Σ_{k<=x} freq[k]) / (count + (censored>0 ? 1 : 0))
+    // 但常规做法 ECDF 在最右仍然趋近 1.0 (Kaplan-Meier 公式已用于 hazard 图,
+    // 这里 ECDF 保持简单口径:分母用 count 即可,censored 在最右用一条短"删失标记"显示)
+    auto drawEmpiricalECDF = [&](const std::array<int, 150>& freq, int total,
+                                  int censored, Gdiplus::Color color) {
+        if (total == 0) return;
+        Gdiplus::Pen pen(color, DPIScaleF(2.5f));
+        double cum = 0.0;
+        // 起点: (0, 0)
+        auto prev_pt = getPt(0, 0);
+        for (int k = 1; k <= max_x; ++k) {
+            if (freq[k] == 0) continue;
+            // 水平段: 上一个跳变点 (x_prev, cum) -> (k, cum)
+            auto h_end = getPt(k, cum);
+            g.DrawLine(&pen, prev_pt.X, prev_pt.Y, h_end.X, h_end.Y);
+            // 垂直段: (k, cum) -> (k, cum + freq[k]/total)
+            cum += (double)freq[k] / (double)total;
+            auto v_end = getPt(k, cum);
+            g.DrawLine(&pen, h_end.X, h_end.Y, v_end.X, v_end.Y);
+            prev_pt = v_end;
+        }
+        // 收尾: 一直画到 max_x (终点贴在 cum 上,通常是 1.0)
+        auto end_pt = getPt(max_x, cum);
+        g.DrawLine(&pen, prev_pt.X, prev_pt.Y, end_pt.X, end_pt.Y);
 
-    Gdiplus::SolidBrush blueBrush(Gdiplus::Color(255, 65, 140, 240)),
-                        redBrush(Gdiplus::Color(255, 240, 80, 80));
-    float legendX = (float)rect.X + (float)rect.Width - DPIScaleF(190.0f);
-    g.DrawString(L"━━ 综合六星出金分布 (含歪)", -1, &tickFont,
-                 Gdiplus::PointF(legendX, (float)rect.Y + DPIScaleF(15.0f)), &blueBrush);
-    g.DrawString(L"━━ 当期限定 UP 出金分布", -1, &tickFont,
-                 Gdiplus::PointF(legendX, (float)rect.Y + DPIScaleF(35.0f)), &redBrush);
+        // 删失标记: 在 censored 位置画一个小垂直短线('+'号),表示当前正在垫刀
+        if (censored > 0 && censored <= max_x) {
+            auto cp = getPt(censored, cum);
+            float cpY = cp.Y;
+            Gdiplus::Pen markPen(color, DPIScaleF(2.0f));
+            g.DrawLine(&markPen, cp.X, cpY - DPIScaleF(5.0f), cp.X, cpY + DPIScaleF(5.0f));
+        }
+    };
+
+    // 顺序: 先画虚线理论, 再画实线经验, 经验在上方更醒目
+    drawTheoryCDF(theory_cdf_all, theory_cdf_all_len, Gdiplus::Color(180, 65, 140, 240));
+    drawTheoryCDF(theory_cdf_up,  theory_cdf_up_len,  Gdiplus::Color(180, 240, 80, 80));
+    drawEmpiricalECDF(freq_all, count_all, censored_all, Gdiplus::Color(255, 65, 140, 240));
+    drawEmpiricalECDF(freq_up,  count_up,  censored_up,  Gdiplus::Color(255, 240, 80, 80));
+
+    // KS 标记: 在偏离最大处画短竖线(仅综合 ECDF)
+    if (count_all > 0 && theory_cdf_all && theory_cdf_all_len >= 2) {
+        double max_d = 0; int max_d_x = 0;
+        double cum = 0;
+        for (int k = 1; k <= max_x && k < theory_cdf_all_len; ++k) {
+            cum += (double)freq_all[k] / (double)count_all;
+            double d = std::fabs(cum - theory_cdf_all[k]);
+            if (d > max_d) { max_d = d; max_d_x = k; }
+        }
+        if (max_d > 0.01 && max_d_x > 0) {
+            double emp_y  = 0;
+            for (int k = 1; k <= max_d_x; ++k) emp_y += (double)freq_all[k] / (double)count_all;
+            double th_y = theory_cdf_all[max_d_x];
+            auto p_emp = getPt(max_d_x, emp_y);
+            auto p_th  = getPt(max_d_x, th_y);
+            Gdiplus::Pen ksPen(Gdiplus::Color(255, 120, 120, 120), DPIScaleF(1.5f));
+            Gdiplus::REAL dash[2] = { DPIScaleF(2.0f), DPIScaleF(2.0f) };
+            ksPen.SetDashPattern(dash, 2);
+            g.DrawLine(&ksPen, p_emp.X, p_emp.Y, p_th.X, p_th.Y);
+            wchar_t lbl[32];
+            swprintf(lbl, 32, L"KS D=%.3f", max_d);
+            float midY = (p_emp.Y + p_th.Y) * 0.5f;
+            g.DrawString(lbl, -1, &tickFont,
+                         Gdiplus::PointF(p_emp.X + DPIScaleF(4.0f), midY - DPIScaleF(7.0f)),
+                         &tickBrush);
+        }
+    }
+
+    // 图例
+    Gdiplus::Font legendFont(&fontFamily, DPIScaleF(12.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::SolidBrush blueBr(Gdiplus::Color(255, 65, 140, 240));
+    Gdiplus::SolidBrush redBr (Gdiplus::Color(255, 240, 80, 80));
+    float legendX = (float)rect.X + (float)rect.Width - DPIScaleF(220.0f);
+    float legendY = (float)rect.Y + DPIScaleF(12.0f);
+    g.FillRectangle(&blueBr, legendX, legendY + DPIScaleF(4.0f), DPIScaleF(14.0f), DPIScaleF(3.0f));
+    g.DrawString(L"综合六星 ECDF", -1, &legendFont,
+                 Gdiplus::PointF(legendX + DPIScaleF(20.0f), legendY - DPIScaleF(2.0f)), &textBrush);
+    g.FillRectangle(&redBr, legendX, legendY + DPIScaleF(20.0f), DPIScaleF(14.0f), DPIScaleF(3.0f));
+    g.DrawString(L"当期限定 UP ECDF", -1, &legendFont,
+                 Gdiplus::PointF(legendX + DPIScaleF(20.0f), legendY + DPIScaleF(14.0f)), &textBrush);
 }
 
-void DrawHazard(Gdiplus::Graphics& g, Gdiplus::Rect rect,
-                const std::array<double, 150>& hazard_all,
-                const std::array<double, 150>& hazard_up,
-                const std::wstring& title, int limit_base,
-                int theory_all_cap = 0, int theory_up_cap = 0) {
+// ---------------------------------------------------------
+// [MRL (Mean Residual Life) 图]
+//
+// MRL(t) = E[X - t | X > t] —— "已经垫了 t 抽,还要再垫多少抽的期望"
+//
+// 经验 MRL 计算 (从 freq 直方图):
+//   MRL_emp(t) = Σ_{k>t} (k-t)·freq[k] / Σ_{k>t} freq[k]
+//   分母 = 0 (即 t >= max_observed) 时 MRL 未定义
+//
+// 显示策略:
+//   - 实线: t 处至少有 2 个观测在分子里 (Σ_{k>t} freq[k] >= 2),数值可靠
+//   - 半透明虚线: 仅 1 个观测,高方差区
+//   - 不画: 0 观测 (无意义)
+//   - 同时画理论 MRL (虚线): 基于理论 CDF 数值积分
+//   - 当前 censored_pity 位置画竖线 + "你在这里"标注 (用户决策视角的关键)
+// ---------------------------------------------------------
+void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
+             const std::array<int, 150>& freq_all,
+             const std::array<int, 150>& freq_up,
+             int count_all, int count_up,
+             int censored_all, int censored_up,
+             const double* theory_cdf_all, int theory_cdf_all_len,
+             const double* theory_cdf_up,  int theory_cdf_up_len,
+             const std::wstring& title, int limit_base,
+             int theory_all_cap = 0, int theory_up_cap = 0) {
     Gdiplus::SolidBrush bgBrush(Gdiplus::Color(255, 252, 253, 255));
     g.FillRectangle(&bgBrush, rect);
     Gdiplus::FontFamily fontFamily(L"Microsoft YaHei");
@@ -1226,96 +1259,206 @@ void DrawHazard(Gdiplus::Graphics& g, Gdiplus::Rect rect,
                  &textBrush);
 
     int max_x = limit_base;
-    double max_y = 0.1;
-    bool hasData = false;
+    bool hasData = (count_all > 0) || (count_up > 0);
     for (int i = 1; i < 150; i++) {
-        if (hazard_all[i] > 0 || hazard_up[i] > 0) {
-            hasData = true;
-            if (i > max_x) max_x = i;
-            if (hazard_all[i] > max_y) max_y = hazard_all[i];
-            if (hazard_up[i]  > max_y) max_y = hazard_up[i];
-        }
+        if (freq_all[i] > 0 || freq_up[i] > 0) if (i > max_x) max_x = i;
     }
-    if (!hasData) return;
+    if (!hasData) {
+        Gdiplus::Font emptyFont(&fontFamily, DPIScaleF(14.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        Gdiplus::SolidBrush emptyBrush(Gdiplus::Color(255, 150, 150, 150));
+        g.DrawString(L"暂无出金数据", -1, &emptyFont,
+                     Gdiplus::PointF((float)rect.X + (float)rect.Width / 2.0f - DPIScaleF(50.0f),
+                                     (float)rect.Y + (float)rect.Height / 2.0f),
+                     &emptyBrush);
+        return;
+    }
     max_x = ((max_x / 10) + 1) * 10;
-    if (max_y > 0.8) max_y = 1.05;
-    else max_y = (std::ceil(max_y * 10)) / 10.0 + 0.1;
 
-    float plotX = (float)rect.X + DPIScaleF(55.0f), plotY = (float)rect.Y + DPIScaleF(45.0f);
-    float plotW = (float)rect.Width - DPIScaleF(85.0f), plotH = (float)rect.Height - DPIScaleF(75.0f);
-    Gdiplus::Pen axisPen(Gdiplus::Color(255, 150, 150, 150), DPIScaleF(1.5f));
-    Gdiplus::Pen gridPen(Gdiplus::Color(255, 235, 235, 235), DPIScaleF(1.0f));
+    // ---- 计算经验 MRL 序列 (并记录每个 t 处的 surviving 计数) ----
+    auto computeEmpiricalMRL = [&](const std::array<int, 150>& freq, int total)
+        -> std::pair<std::array<double, 150>, std::array<int, 150>> {
+        std::array<double, 150> mrl{}; mrl.fill(-1.0);  // -1 = undefined
+        std::array<int, 150> surv{}; surv.fill(0);
+        if (total == 0) return {mrl, surv};
+        // 后缀和: 从最大 max_x 往回累加
+        long long suf_count = 0, suf_weighted = 0;
+        for (int t = max_x; t >= 0; --t) {
+            // 在循环开始时 suf_count = Σ_{k>t} freq[k], 注意 k 从 t+1 开始
+            // 我们要在每一步先用当前累积值算 MRL(t),再把 freq[t] 累加进去给下一轮 t-1 用
+            surv[t] = (int)suf_count;
+            if (suf_count >= 1) {
+                mrl[t] = (double)(suf_weighted - (long long)t * suf_count) / (double)suf_count;
+            }
+            if (t >= 1) {
+                suf_count    += freq[t];
+                suf_weighted += (long long)t * freq[t];
+            }
+        }
+        return {mrl, surv};
+    };
+
+    auto mrl_all = computeEmpiricalMRL(freq_all, count_all);
+    auto mrl_up  = computeEmpiricalMRL(freq_up,  count_up);
+
+    // ---- 计算理论 MRL (基于理论 CDF) ----
+    auto computeTheoryMRL = [&](const double* cdf, int cdf_len) {
+        std::array<double, 150> tmrl{}; tmrl.fill(-1.0);
+        if (!cdf || cdf_len < 2) return tmrl;
+        int upper = cdf_len - 1;  // CDF 最大有效索引
+        // 从 PDF: pdf[k] = cdf[k] - cdf[k-1], for k=1..upper
+        // MRL(t) = Σ_{k>t} (k-t) · pdf[k] / (1 - cdf[t])
+        for (int t = 0; t <= upper - 1 && t <= max_x; ++t) {
+            double surv_t = 1.0 - cdf[t];
+            if (surv_t < 1e-9) break;
+            double num = 0.0;
+            for (int k = t + 1; k <= upper; ++k) {
+                double pdf_k = cdf[k] - cdf[k-1];
+                num += (double)(k - t) * pdf_k;
+            }
+            tmrl[t] = num / surv_t;
+        }
+        return tmrl;
+    };
+    auto theory_mrl_all = computeTheoryMRL(theory_cdf_all, theory_cdf_all_len);
+    auto theory_mrl_up  = computeTheoryMRL(theory_cdf_up,  theory_cdf_up_len);
+
+    // ---- Y 轴范围: 取所有 MRL 值的最大值 ----
+    double max_y = 1.0;
+    for (int t = 0; t <= max_x; ++t) {
+        if (mrl_all.first[t] > max_y) max_y = mrl_all.first[t];
+        if (mrl_up.first[t]  > max_y) max_y = mrl_up.first[t];
+        if (theory_mrl_all[t] > max_y) max_y = theory_mrl_all[t];
+        if (theory_mrl_up[t]  > max_y) max_y = theory_mrl_up[t];
+    }
+    // 取整到 10 的倍数,留 10% 顶部空间
+    max_y = std::ceil(max_y * 1.1 / 10.0) * 10.0;
+    if (max_y < 10) max_y = 10;
+
+    // ---- 网格 + 坐标轴 ----
+    Gdiplus::Pen gridPen(Gdiplus::Color(255, 230, 230, 230), DPIScaleF(1.0f));
+    Gdiplus::Pen axisPen(Gdiplus::Color(255, 80, 80, 80),  DPIScaleF(1.0f));
+    float plotX = (float)rect.X + DPIScaleF(50.0f);
+    float plotY = (float)rect.Y + DPIScaleF(40.0f);
+    float plotW = (float)rect.Width  - DPIScaleF(70.0f);
+    float plotH = (float)rect.Height - DPIScaleF(60.0f);
+    if (plotW <= 0 || plotH <= 0) return;
+
+    g.DrawLine(&axisPen, plotX, plotY,         plotX, plotY + plotH);
     g.DrawLine(&axisPen, plotX, plotY + plotH, plotX + plotW, plotY + plotH);
-    g.DrawLine(&axisPen, plotX, plotY, plotX, plotY + plotH);
 
-    auto getPt = [&](int x, double y) {
+    auto getPt = [&](int x, double y) -> Gdiplus::PointF {
+        if (y < 0) y = 0; if (y > max_y) y = max_y;
         return Gdiplus::PointF(plotX + (float)x / (float)max_x * plotW,
                                plotY + plotH - (float)(y / max_y) * plotH);
     };
+
     Gdiplus::Font tickFont(&fontFamily, DPIScaleF(11.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::SolidBrush tickBrush(Gdiplus::Color(255, 120, 120, 120));
 
+    // Y 轴刻度 (单位: 抽)
     for (int i = 0; i <= 4; ++i) {
+        double y_val = max_y * (double)i / 4.0;
         float py = plotY + plotH - (float)i / 4.0f * plotH;
         if (i > 0) g.DrawLine(&gridPen, plotX, py, plotX + plotW, py);
         g.DrawLine(&axisPen, plotX - DPIScaleF(5.0f), py, plotX, py);
-        wchar_t y_label[32]; swprintf(y_label, 32, L"%.0f%%", (max_y / 4.0) * i * 100.0);
+        wchar_t y_label[16]; swprintf(y_label, 16, L"%.0f", y_val);
         float labelW = (float)wcslen(y_label) * DPIScaleF(5.5f) + DPIScaleF(8.0f);
         g.DrawString(y_label, -1, &tickFont, Gdiplus::PointF(plotX - labelW, py - DPIScaleF(6.0f)), &tickBrush);
     }
+    // X 轴刻度
     int step = (max_x > 140) ? 20 : 10;
     for (int x = 0; x <= max_x; x += step) {
         float px = plotX + (float)x / (float)max_x * plotW;
         g.DrawLine(&axisPen, px, plotY + plotH, px, plotY + plotH + DPIScaleF(5.0f));
         wchar_t x_label[16]; swprintf(x_label, 16, L"%d", x);
         float xoff = (x < 10 ? 4.0f : x < 100 ? 8.0f : 12.0f) * DPIScaleF(1.0f);
-        g.DrawString(x_label, -1, &tickFont, Gdiplus::PointF(px - xoff, plotY + plotH + DPIScaleF(8.0f)), &tickBrush);
+        g.DrawString(x_label, -1, &tickFont,
+                     Gdiplus::PointF(px - xoff, plotY + plotH + DPIScaleF(8.0f)), &tickBrush);
     }
 
-    float barW = (std::max)(1.5f, plotW / max_x * 0.4f);
-    Gdiplus::SolidBrush brushAll(Gdiplus::Color(180, 65, 140, 240));
-    // hazard_all 理论只分布在 [1, theory_all_cap](例如 80),超出部分不该有数据
-    int cap_all = (theory_all_cap > 0) ? theory_all_cap : max_x;
-    for (int x = 1; x <= (std::min)(max_x, cap_all); x++) {
-        if (hazard_all[x] > 0) {
-            Gdiplus::PointF p = getPt(x, hazard_all[x]);
-            g.FillRectangle(&brushAll, p.X - barW, p.Y, barW, plotY + plotH - p.Y);
+    // ---- 画理论 MRL (虚线) ----
+    auto drawTheoryMRL = [&](const std::array<double, 150>& tmrl, int cap, Gdiplus::Color color) {
+        Gdiplus::Pen pen(color, DPIScaleF(1.5f));
+        Gdiplus::REAL dash[2] = { DPIScaleF(4.0f), DPIScaleF(3.0f) };
+        pen.SetDashPattern(dash, 2);
+        int upper = (cap > 0 && cap <= max_x) ? cap : max_x;
+        Gdiplus::PointF prev;
+        bool has_prev = false;
+        for (int t = 0; t <= upper; ++t) {
+            if (tmrl[t] < 0) { has_prev = false; continue; }
+            auto p = getPt(t, tmrl[t]);
+            if (has_prev) g.DrawLine(&pen, prev.X, prev.Y, p.X, p.Y);
+            prev = p; has_prev = true;
         }
-    }
-    Gdiplus::SolidBrush brushUp(Gdiplus::Color(180, 240, 80, 80));
-    // hazard_up 理论分布到 [1, theory_up_cap](例如 120)
-    int cap_up = (theory_up_cap > 0) ? theory_up_cap : max_x;
-    for (int x = 1; x <= (std::min)(max_x, cap_up); x++) {
-        if (hazard_up[x] > 0) {
-            Gdiplus::PointF p = getPt(x, hazard_up[x]);
-            g.FillRectangle(&brushUp, p.X, p.Y, barW, plotY + plotH - p.Y);
+    };
+    drawTheoryMRL(theory_mrl_all, theory_all_cap, Gdiplus::Color(180, 65, 140, 240));
+    drawTheoryMRL(theory_mrl_up,  theory_up_cap,  Gdiplus::Color(180, 240, 80, 80));
+
+    // ---- 画经验 MRL (实线: surv>=2; 虚线: surv==1) ----
+    // 接受 RGB 三个分量(避免依赖 Gdiplus::Color::GetR/G/B 的 SDK 兼容问题)
+    auto drawEmpiricalMRL = [&](const std::pair<std::array<double, 150>, std::array<int, 150>>& mrl_data,
+                                 BYTE r, BYTE gC, BYTE b) {
+        const auto& mrl = mrl_data.first;
+        const auto& surv = mrl_data.second;
+        Gdiplus::Pen solidPen(Gdiplus::Color(255, r, gC, b), DPIScaleF(2.5f));
+        Gdiplus::Pen dashPen(Gdiplus::Color(180, r, gC, b),  DPIScaleF(1.8f));
+        Gdiplus::REAL dash[2] = { DPIScaleF(2.0f), DPIScaleF(2.0f) };
+        dashPen.SetDashPattern(dash, 2);
+        Gdiplus::PointF prev; bool has_prev = false; bool prev_solid = true;
+        for (int t = 0; t <= max_x; ++t) {
+            if (mrl[t] < 0 || surv[t] == 0) { has_prev = false; continue; }
+            auto p = getPt(t, mrl[t]);
+            bool solid = (surv[t] >= 2);
+            if (has_prev) {
+                Gdiplus::Pen* pen = (solid && prev_solid) ? &solidPen : &dashPen;
+                g.DrawLine(pen, prev.X, prev.Y, p.X, p.Y);
+            }
+            prev = p; has_prev = true; prev_solid = solid;
         }
-    }
+    };
+    drawEmpiricalMRL(mrl_all, 65, 140, 240);
+    drawEmpiricalMRL(mrl_up,  240, 80, 80);
 
-    // 理论上限分隔线:hazard_all 的硬保底位置(例如 80)
-    // 超过这条线本不该再出现蓝色柱子 —— 如果出现,说明数据异常
-    if (theory_all_cap > 0 && theory_all_cap < max_x) {
-        Gdiplus::Pen capPen(Gdiplus::Color(200, 180, 180, 180), DPIScaleF(1.0f));
-        Gdiplus::REAL dashPattern[] = { 4.0f, 3.0f };
-        capPen.SetDashPattern(dashPattern, 2);
-        float cx = plotX + (float)theory_all_cap / (float)max_x * plotW;
-        g.DrawLine(&capPen, cx, plotY, cx, plotY + plotH);
+    // ---- "你在这里" 竖线 (当前 censored_pity 位置) ----
+    auto drawCensoredMarker = [&](int censored, const std::pair<std::array<double, 150>, std::array<int, 150>>& mrl_data,
+                                   const std::array<double, 150>& tmrl, int theory_cap, Gdiplus::Color color) {
+        if (censored <= 0 || censored > max_x) return;
+        // 优先取理论 MRL 值,经验 MRL 在该 t 可能不存在
+        double y_value = -1.0;
+        if (censored < (int)tmrl.size() && tmrl[censored] > 0
+            && (theory_cap == 0 || censored <= theory_cap)) {
+            y_value = tmrl[censored];
+        } else if (mrl_data.first[censored] > 0) {
+            y_value = mrl_data.first[censored];
+        }
+        if (y_value <= 0) return;
+        Gdiplus::Pen markPen(color, DPIScaleF(1.5f));
+        Gdiplus::REAL dash[2] = { DPIScaleF(3.0f), DPIScaleF(3.0f) };
+        markPen.SetDashPattern(dash, 2);
+        auto top = getPt(censored, y_value);
+        g.DrawLine(&markPen, top.X, top.Y, top.X, plotY + plotH);
+        wchar_t lbl[64];
+        swprintf(lbl, 64, L"已垫 %d 抽\n预期还需 %.1f 抽", censored, y_value);
+        Gdiplus::SolidBrush lblBrush(color);
+        g.DrawString(lbl, -1, &tickFont,
+                     Gdiplus::PointF(top.X + DPIScaleF(4.0f), top.Y - DPIScaleF(4.0f)),
+                     &lblBrush);
+    };
+    drawCensoredMarker(censored_all, mrl_all, theory_mrl_all, theory_all_cap, Gdiplus::Color(255, 65, 140, 240));
+    drawCensoredMarker(censored_up,  mrl_up,  theory_mrl_up,  theory_up_cap,  Gdiplus::Color(255, 240, 80, 80));
 
-        Gdiplus::Font capFont(&fontFamily, DPIScaleF(10.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-        Gdiplus::SolidBrush capBrush(Gdiplus::Color(255, 150, 150, 150));
-        wchar_t capLabel[32];
-        swprintf(capLabel, 32, L"理论上限 %d", theory_all_cap);
-        g.DrawString(capLabel, -1, &capFont,
-                     Gdiplus::PointF(cx + DPIScaleF(3.0f), plotY + DPIScaleF(2.0f)), &capBrush);
-    }
-
-    Gdiplus::SolidBrush blueBrush(Gdiplus::Color(255, 65, 140, 240)),
-                        redBrush(Gdiplus::Color(255, 240, 80, 80));
-    float legendX = (float)rect.X + (float)rect.Width - DPIScaleF(160.0f);
-    g.DrawString(L"■ 综合六星条件概率", -1, &tickFont,
-                 Gdiplus::PointF(legendX, (float)rect.Y + DPIScaleF(15.0f)), &blueBrush);
-    g.DrawString(L"■ 限定 UP 条件概率", -1, &tickFont,
-                 Gdiplus::PointF(legendX, (float)rect.Y + DPIScaleF(35.0f)), &redBrush);
+    // ---- 图例 ----
+    Gdiplus::Font legendFont(&fontFamily, DPIScaleF(12.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::SolidBrush blueBr(Gdiplus::Color(255, 65, 140, 240));
+    Gdiplus::SolidBrush redBr (Gdiplus::Color(255, 240, 80, 80));
+    float legendX = (float)rect.X + (float)rect.Width - DPIScaleF(220.0f);
+    float legendY = (float)rect.Y + DPIScaleF(12.0f);
+    g.FillRectangle(&blueBr, legendX, legendY + DPIScaleF(4.0f), DPIScaleF(14.0f), DPIScaleF(3.0f));
+    g.DrawString(L"综合六星 剩余期望", -1, &legendFont,
+                 Gdiplus::PointF(legendX + DPIScaleF(20.0f), legendY - DPIScaleF(2.0f)), &textBrush);
+    g.FillRectangle(&redBr, legendX, legendY + DPIScaleF(20.0f), DPIScaleF(14.0f), DPIScaleF(3.0f));
+    g.DrawString(L"当期限定 UP 剩余期望", -1, &legendFont,
+                 Gdiplus::PointF(legendX + DPIScaleF(20.0f), legendY + DPIScaleF(14.0f)), &textBrush);
 }
 
 void RebuildChartCache(HWND hwnd) {
@@ -1334,20 +1477,36 @@ void RebuildChartCache(HWND hwnd) {
     {
         Gdiplus::Graphics g(hdcMem);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        // 角色 KDE:X 轴覆盖 UP 硬保底 120(UP 分布延伸到此)
-        DrawKDE   (g, Gdiplus::Rect(DPIScale(20),  DPIScale(360), DPIScale(600), DPIScale(250)),
-                   statsChar.freq_all, statsChar.freq_up, L"角色期望核密度", 120);
-        // 角色风险函数:X=80 是综合 hazard_all 的硬保底,X=120 是 hazard_up 的硬保底
-        DrawHazard(g, Gdiplus::Rect(DPIScale(640), DPIScale(360), DPIScale(600), DPIScale(250)),
-                   statsChar.hazard_all, statsChar.hazard_up, L"角色经验风险函数", 120,
+        // 角色 ECDF: X 轴覆盖 UP 硬保底 120 (UP 分布延伸到此)
+        // 理论 CDF 仅画综合(g_cdf_char), UP 理论分布需要更复杂的卷积建模, 暂不画
+        DrawECDF  (g, Gdiplus::Rect(DPIScale(20),  DPIScale(360), DPIScale(600), DPIScale(250)),
+                   statsChar.freq_all, statsChar.freq_up,
+                   statsChar.count_all, statsChar.count_up,
+                   statsChar.censored_pity_all, statsChar.censored_pity_up,
+                   g_cdf_char, 82, nullptr, 0,
+                   L"角色累积分布 (ECDF)", 120);
+        // 角色 MRL: X=80 是综合 6 星硬保底 (理论 MRL 上限), X=120 是 UP 硬保底
+        DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(360), DPIScale(600), DPIScale(250)),
+                   statsChar.freq_all, statsChar.freq_up,
+                   statsChar.count_all, statsChar.count_up,
+                   statsChar.censored_pity_all, statsChar.censored_pity_up,
+                   g_cdf_char, 82, nullptr, 0,
+                   L"角色剩余抽数期望 (MRL)", 120,
                    /*theory_all_cap=*/80, /*theory_up_cap=*/120);
-        // 武器 KDE:X 轴覆盖 UP 硬保底 80
-        DrawKDE   (g, Gdiplus::Rect(DPIScale(20),  DPIScale(615), DPIScale(600), DPIScale(250)),
-                   statsWep.freq_all, statsWep.freq_up, L"武器期望核密度", 80);
-        // 武器风险函数:X=40 是综合 hazard_all 的硬保底(十连粒度),
-        //              X=80 是 hazard_up 的硬保底(UP 保底十连)
-        DrawHazard(g, Gdiplus::Rect(DPIScale(640), DPIScale(615), DPIScale(600), DPIScale(250)),
-                   statsWep.hazard_all, statsWep.hazard_up, L"武器经验风险函数", 80,
+        // 武器 ECDF: X 轴覆盖 UP 硬保底 80
+        DrawECDF  (g, Gdiplus::Rect(DPIScale(20),  DPIScale(615), DPIScale(600), DPIScale(250)),
+                   statsWep.freq_all, statsWep.freq_up,
+                   statsWep.count_all, statsWep.count_up,
+                   statsWep.censored_pity_all, statsWep.censored_pity_up,
+                   g_cdf_wep, 41, nullptr, 0,
+                   L"武器累积分布 (ECDF)", 80);
+        // 武器 MRL: X=40 综合硬保底, X=80 UP 硬保底
+        DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(615), DPIScale(600), DPIScale(250)),
+                   statsWep.freq_all, statsWep.freq_up,
+                   statsWep.count_all, statsWep.count_up,
+                   statsWep.censored_pity_all, statsWep.censored_pity_up,
+                   g_cdf_wep, 41, nullptr, 0,
+                   L"武器剩余抽数期望 (MRL)", 80,
                    /*theory_all_cap=*/40, /*theory_up_cap=*/80);
     }
     SelectObject(hdcMem, hOld);
@@ -1395,7 +1554,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL,
             DPIScale(20), DPIScale(135), DPIScale(1220), DPIScale(215), hwnd, NULL, NULL, NULL);
 
-        DWORD tabStops[] = {200};
+        DWORD tabStops[] = {50};
         SendMessage(hOutEdit, EM_SETTABSTOPS, 1, (LPARAM)tabStops);
         SendMessage(hOutEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)GetSysColor(COLOR_3DFACE));
 
