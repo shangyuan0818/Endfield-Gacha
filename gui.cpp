@@ -1611,7 +1611,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL,
             DPIScale(20), DPIScale(135), DPIScale(1220), DPIScale(215), hwnd, NULL, NULL, NULL);
 
-        DWORD tabStops[] = {200};
+        DWORD tabStops[] = {50};
         SendMessage(hOutEdit, EM_SETTABSTOPS, 1, (LPARAM)tabStops);
         SendMessage(hOutEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)GetSysColor(COLOR_3DFACE));
 
