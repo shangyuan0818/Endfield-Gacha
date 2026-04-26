@@ -214,28 +214,109 @@ std::unordered_map<std::string, std::string, StringHash, std::equal_to<>> ParseP
     return result;
 }
 
+// 上面两个函数依赖 WideToUtf8 → 仅在主线程安全使用(WideCharToMultiByte 本身
+// 是 thread-safe,但 GetWindowText 必须在主线程,所以是分两步:主线程提取 wstring
+// 后转 utf8,然后这两个 FromUtf8 版本在 worker 上跑)。下面是 utf8 直进版本:
+inline std::string TrimUtf8(std::string_view sv) {
+    size_t b = sv.find_first_not_of(" \t\r\n");
+    if (b == std::string_view::npos) return {};
+    size_t e = sv.find_last_not_of(" \t\r\n");
+    return std::string(sv.substr(b, e - b + 1));
+}
+
+std::unordered_set<std::string, StringHash, std::equal_to<>> ParseCommaSeparatedUtf8FromUtf8(std::string_view text) {
+    std::unordered_set<std::string, StringHash, std::equal_to<>> result;
+    // 切分 ASCII 逗号 ',' 和 utf8 全角逗号 ',' (E3 80 81/EF BC 8C)
+    // 实际只考虑 EF BC 8C (FF0C 的 utf8 编码)
+    std::string cur;
+    for (size_t i = 0; i < text.size();) {
+        // 检测 EF BC 8C (UTF-8 of U+FF0C)
+        if (i + 2 < text.size()
+            && (uint8_t)text[i]   == 0xEF
+            && (uint8_t)text[i+1] == 0xBC
+            && (uint8_t)text[i+2] == 0x8C) {
+            std::string trimmed = TrimUtf8(cur);
+            if (!trimmed.empty()) result.insert(std::move(trimmed));
+            cur.clear();
+            i += 3;
+        } else if (text[i] == ',') {
+            std::string trimmed = TrimUtf8(cur);
+            if (!trimmed.empty()) result.insert(std::move(trimmed));
+            cur.clear();
+            ++i;
+        } else {
+            cur += text[i++];
+        }
+    }
+    std::string trimmed = TrimUtf8(cur);
+    if (!trimmed.empty()) result.insert(std::move(trimmed));
+    return result;
+}
+
+std::unordered_map<std::string, std::string, StringHash, std::equal_to<>> ParsePoolMapUtf8FromUtf8(std::string_view text) {
+    std::unordered_map<std::string, std::string, StringHash, std::equal_to<>> result;
+    std::string cur, cur_pool;
+    bool reading_up = false;
+    auto flush_entry = [&]() {
+        if (!cur_pool.empty()) {
+            std::string up = TrimUtf8(cur);
+            if (!up.empty()) result[cur_pool] = std::move(up);
+        }
+        cur.clear(); cur_pool.clear(); reading_up = false;
+    };
+    for (size_t i = 0; i < text.size();) {
+        // ':' (ASCII) 或 ':' (UTF-8 of U+FF1A: EF BC 9A)
+        bool is_colon_full = (i + 2 < text.size()
+                              && (uint8_t)text[i]   == 0xEF
+                              && (uint8_t)text[i+1] == 0xBC
+                              && (uint8_t)text[i+2] == 0x9A);
+        bool is_comma_full = (i + 2 < text.size()
+                              && (uint8_t)text[i]   == 0xEF
+                              && (uint8_t)text[i+1] == 0xBC
+                              && (uint8_t)text[i+2] == 0x8C);
+        if ((text[i] == ':' || is_colon_full) && !reading_up) {
+            cur_pool = TrimUtf8(cur); cur.clear(); reading_up = true;
+            i += is_colon_full ? 3 : 1;
+        } else if (text[i] == ',' || is_comma_full) {
+            flush_entry();
+            i += is_comma_full ? 3 : 1;
+        } else {
+            cur += text[i++];
+        }
+    }
+    if (reading_up) flush_entry();
+    return result;
+}
+
 // ---------------------------------------------------------
 // [SoA 分桶 - 角色/武器 独立桶,Calculate 不再 filter 全量]
-// 热路径只访问 3 个字段:rank_types / names / poolNames(角色桶用)
+// 热路径只访问 4 个字段:rank_types / names / poolNames / is_free
+// is_free: 标记"第30抽赠送十连"的成员,该机制不占用也不增加保底进度
+// (依据《明日方舟终末地抽卡机制解析》2.1.1)
 // ---------------------------------------------------------
 struct PullBucket {
     std::pmr::vector<RankType>         rank_types;
     std::pmr::vector<std::string_view> names;
     std::pmr::vector<std::string_view> poolNames;
+    std::pmr::vector<uint8_t>          is_free;
 
     explicit PullBucket(std::pmr::polymorphic_allocator<std::byte> alloc)
-        : rank_types(alloc), names(alloc), poolNames(alloc) {}
+        : rank_types(alloc), names(alloc), poolNames(alloc), is_free(alloc) {}
 
     void reserve(size_t cap) {
-        rank_types.reserve(cap); names.reserve(cap); poolNames.reserve(cap);
+        rank_types.reserve(cap); names.reserve(cap);
+        poolNames.reserve(cap);  is_free.reserve(cap);
     }
-    void push_back(RankType rt, std::string_view name, std::string_view pool) {
-        rank_types.push_back(rt); names.push_back(name); poolNames.push_back(pool);
+    void push_back(RankType rt, std::string_view name, std::string_view pool, uint8_t free_flag) {
+        rank_types.push_back(rt); names.push_back(name);
+        poolNames.push_back(pool); is_free.push_back(free_flag);
     }
     size_t size() const { return rank_types.size(); }
 };
 
-struct alignas(64) StatsAccumulator {
+// alignas(128) 而非 64: Apple Silicon 与 Intel Sandy Bridge+ 上 spatial prefetcher
+// 会预取相邻 cacheline (128B), 用 128 对齐避免 false sharing 更稳妥
+struct alignas(128) StatsAccumulator {
     std::array<int, 150> freq_all{};
     std::array<int, 150> freq_up{};
     long long sum_all = 0, sum_sq_all = 0, sum_up = 0, sum_sq_up = 0, sum_win = 0;
@@ -303,8 +384,12 @@ float DPIScaleF(float value) { return value * (g_dpi / 96.0f); }
 //     x=31..40:  保底十连条件分布,归一化常数 = 1 - 0.96^10
 static double g_cdf_char[82] = {};  // x=0..80,角色池
 static double g_cdf_wep[41]  = {};  // x=0..40,武器池
+static bool   g_cdf_init     = false;
 
 void InitCDFTables() {
+    // 幂等保护: 多次调用只填充一次
+    // 注意: 为了避免另一线程读到"半初始化"的表, init 标记必须在末尾才置 true
+    if (g_cdf_init) return;
     // ---- 角色池 ----
     // 综合六星分布(含 k=30 特殊十连 11 次判定)
     double surv = 1.0;
@@ -364,6 +449,8 @@ void InitCDFTables() {
         }
         // g_cdf_wep[40] 应该 ≈ 1.0
     }
+
+    g_cdf_init = true;  // 末尾置位,确保所有读者看到完整表
 }
 
 // 修复:离散阶梯 CDF 的 K-S 统计量需严格对齐两条阶梯
@@ -374,6 +461,8 @@ void InitCDFTables() {
 double ComputeKS(const std::array<int, 150>& freq, int max_pity, int n,
                  const double* cdf_table, int cdf_len) {
     if (n == 0) return 0.0;
+    // 防御性 clamp: freq 数组容量 150,max_pity 必须 < 150 否则越界读
+    if (max_pity > 149) max_pity = 149;
     double max_d = 0.0;
     int cum_count = 0;
     for (int x = 1; x <= max_pity; ++x) {
@@ -466,21 +555,38 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     int current_pity = 0, pity_since_last_up = 0;
     bool had_non_up = false;  // 仅用于角色池的小保底追踪
 
+    // 第30抽赠送十连处理 (依据《明日方舟终末地抽卡机制解析》2.1.1):
+    //   - "该十连享有基础概率(0.008),但不占用也不增加保底进度"
+    //   - 数据中用 isFree=true 标记 (10 条独立记录)
+    //   - 不推进 current_pity / pity_since_last_up (本体保底通道独立)
+    //   - 若赠送内出 6 星,归入 freq_all[30] (与理论 CDF 第30抽节点的合并 hazard
+    //     `1-(1-0.008)^11` 对齐),sum_all 按 30 计入
+    //   - 赠送出货不重置玩家本体 cur_pity (独立通道)
+    //   - 仍计入 count_all / count_up / win_5050 / lose_5050 (这是真实出货)
     const size_t total = bucket.size();
     for (size_t i = 0; i < total; ++i) {
-        ++current_pity;
-        ++pity_since_last_up;
+        const bool isFree = bucket.is_free[i];
+
+        // 赠送十连不推进保底通道
+        if (!isFree) {
+            ++current_pity;
+            ++pity_since_last_up;
+        }
 
         // 非六星:likely 分支
         if (bucket.rank_types[i] != RankType::Rank6) [[likely]] {
             continue;
         }
 
-        if (current_pity < 150) acc.freq_all[current_pity]++;
-        if (current_pity > acc.max_pity_all) acc.max_pity_all = current_pity;
+        // 出 6 星. 决定计入 freq 的位置:
+        //   - 赠送十连出货 -> 归入 freq[30]
+        //   - 正常出货 -> 归入 freq[current_pity]
+        const int slot_all = isFree ? 30 : current_pity;
+        if (slot_all < 150) acc.freq_all[slot_all]++;
+        if (slot_all > acc.max_pity_all) acc.max_pity_all = slot_all;
         acc.count_all++;
-        acc.sum_all    += current_pity;
-        acc.sum_sq_all += (long long)current_pity * current_pity;
+        acc.sum_all    += slot_all;
+        acc.sum_sq_all += (long long)slot_all * slot_all;
 
         bool isUP = false;
         auto it = pool_map.find(bucket.poolNames[i]);
@@ -488,11 +594,12 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         else                      isUP = !standard_names.contains(bucket.names[i]);
 
         if (isUP) {
-            if (pity_since_last_up < 150) acc.freq_up[pity_since_last_up]++;
-            if (pity_since_last_up > acc.max_pity_up) acc.max_pity_up = pity_since_last_up;
+            const int slot_up = isFree ? 30 : pity_since_last_up;
+            if (slot_up < 150) acc.freq_up[slot_up]++;
+            if (slot_up > acc.max_pity_up) acc.max_pity_up = slot_up;
             acc.count_up++;
-            acc.sum_up    += pity_since_last_up;
-            acc.sum_sq_up += (long long)pity_since_last_up * pity_since_last_up;
+            acc.sum_up    += slot_up;
+            acc.sum_sq_up += (long long)slot_up * slot_up;
 
             // win_5050 分子:
             //   - 角色池:只在 50/50 阶段(!had_non_up)的 UP 才计入,大保底必中 UP 不算
@@ -503,10 +610,11 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
             } else if (!had_non_up) {
                 acc.win_5050++;
                 acc.count_win++;
-                acc.sum_win += current_pity;
+                acc.sum_win += slot_all;
             }
             had_non_up = false;
-            pity_since_last_up = 0;
+            // 赠送十连出 UP 不重置 pity_since_last_up (独立通道); 正常出 UP 重置
+            if (!isFree) pity_since_last_up = 0;
         } else {
             // lose_5050 分母:
             //   - 角色池:上一次 6 星是 UP(had_non_up=false)→ 现在这个是"歪了",首次计入
@@ -520,13 +628,21 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
             }
             had_non_up = true;
         }
-        current_pity = 0;
+        // 赠送十连出货不重置 current_pity (独立通道); 正常出货重置
+        if (!isFree) current_pity = 0;
     }
 
     // 右删失:遍历结束时若仍有未结算的 pity,记录为删失样本
     // 这些抽数"存活"到了 current_pity 抽仍未出 6 星(或 UP)
     acc.censored_pity_all = current_pity;
     acc.censored_pity_up  = pity_since_last_up;
+
+    // 防御性 clamp:即使数据异常导致 max_pity / censored_pity > 149,
+    // 后续 ComputeKS 与 hazard 循环的索引访问也必须安全
+    if (acc.max_pity_all > 149) acc.max_pity_all = 149;
+    if (acc.max_pity_up  > 149) acc.max_pity_up  = 149;
+    if (acc.censored_pity_all > 149) acc.censored_pity_all = 149;
+    if (acc.censored_pity_up  > 149) acc.censored_pity_up  = 149;
 
     StatsResult s;
     s.freq_all  = acc.freq_all;
@@ -565,6 +681,7 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     if (acc.count_all > 0 || acc.censored_pity_all > 0) {
         int survivors = acc.count_all + (acc.censored_pity_all > 0 ? 1 : 0);
         int max_reach_all = (std::max)(acc.max_pity_all, acc.censored_pity_all);
+        if (max_reach_all > 149) max_reach_all = 149;  // 防御性 clamp(已被上游保证,这里再防一道)
         for (int x = 1; x <= max_reach_all; ++x) {
             if (survivors > 0) {
                 s.hazard_all[x] = (double)acc.freq_all[x] / survivors;
@@ -586,6 +703,7 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     if (acc.count_up > 0 || acc.censored_pity_up > 0) {
         int survivors = acc.count_up + (acc.censored_pity_up > 0 ? 1 : 0);
         int max_reach_up = (std::max)(acc.max_pity_up, acc.censored_pity_up);
+        if (max_reach_up > 149) max_reach_up = 149;  // 防御性 clamp
         for (int x = 1; x <= max_reach_up; ++x) {
             if (survivors > 0) {
                 s.hazard_up[x] = (double)acc.freq_up[x] / survivors;
@@ -635,28 +753,76 @@ inline std::wstring GetDynamicWindowText(HWND hwnd) {
     return buf;
 }
 
-void ProcessFile(const std::wstring& path) {
-    auto stdChars = ParseCommaSeparatedUtf8(GetDynamicWindowText(hCharEdit));
-    auto poolMap  = ParsePoolMapUtf8       (GetDynamicWindowText(hPoolMapEdit));
-    auto stdWeps  = ParseCommaSeparatedUtf8(GetDynamicWindowText(hWepEdit));
+// ---------------------------------------------------------
+// [文件处理 - 工作线程化]
+//
+// 原版 WM_DROPFILES 同步调 ProcessFile + RebuildChartCache,期间窗口消息
+// 循环阻塞,用户无法移动窗口/输入/最小化。重构后:
+//   1) 主线程做 I/O 准备(读 GUI 文本框 + 把文件内容拷到 std::string)
+//   2) Worker 线程做纯 CPU 计算(JSON 解析 + Calculate),结果写入 heap 上
+//      的 ProcessOutput 对象
+//   3) Worker 用 PostMessage(WM_APP_PROCESS_DONE) 把结果指针回投到主线程
+//   4) 主线程在该消息处理中更新 statsChar/statsWep + UI,然后 delete output
+//
+// 注意:
+//   - GDI / SetWindowTextW 都不是 thread-safe,只能在主线程调
+//   - statsChar/statsWep 是全局,WM_PAINT 通过 g_hChartBmp 间接读它们,
+//     但 g_hChartBmp 由 RebuildChartCache 重建,所以只要 RebuildChartCache
+//     和 statsChar 写入都在主线程串行,就不需要锁
+//   - g_processing 标志防止 worker 跑时重复触发(双开 worker)
+// ---------------------------------------------------------
 
-    FileGuard hFile;
-    hFile.h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                          NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile.h == INVALID_HANDLE_VALUE) return;
+#define WM_APP_PROCESS_DONE  (WM_APP + 1)
 
-    DWORD fileSize = GetFileSize(hFile, NULL);
-    if (fileSize == 0 || fileSize == INVALID_FILE_SIZE) return;
+// 前向声明:RebuildChartCache 定义在 DrawKDE/DrawHazard 之后,但 ProcessFile_Consume
+// 需要在文件中段调用它。
+void RebuildChartCache(HWND hwnd);
 
-    MapGuard hMap;
-    hMap.h = CreateFileMappingW(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-    if (!hMap.h) return;
+// 跨线程载荷:主线程构造,worker 填充结果,主线程消费后 delete
+struct ProcessOutput {
+    HWND        hwnd_main = NULL;  // 主窗口,worker 用 PostMessage 回投到这里
 
-    ViewGuard view;
-    view.p = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
-    if (!view.p) return;
+    // === 主线程预填(由 ProcessFile_Submit 设置) ===
+    // 文件 buffer 用 mmap 直读,零拷贝(与原版 ProcessFile + macOS Analyzer 对齐)。
+    // 三个 handle 必须存活到 Consume 阶段才能 unmap/close,因为 ExportRecord
+    // 内的 string_view 都指向 mmap 区域。
+    HANDLE      hFile = INVALID_HANDLE_VALUE;
+    HANDLE      hMap  = NULL;
+    const void* viewPtr = nullptr;
+    DWORD       fileSize = 0;
 
-    std::string_view bufferView((const char*)view.p, fileSize);
+    std::string utf8_chars;     // 来自 hCharEdit (这个无法 mmap,GUI 控件文本必须主线程 GetWindowText)
+    std::string utf8_poolMap;
+    std::string utf8_weps;
+
+    // === worker 填充 ===
+    bool        ok = false;
+    StatsResult statsChar;
+    StatsResult statsWep;
+    std::wstring outMsg;
+    std::wstring errMsg;
+
+    ~ProcessOutput() {
+        // 主线程消费后调 delete 时统一清理 mmap 资源
+        if (viewPtr) UnmapViewOfFile(viewPtr);
+        if (hMap)    CloseHandle(hMap);
+        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+    }
+};
+
+// 用全局原子防双开;Win32 上 LONG volatile + InterlockedExchange 等价于 atomic_flag
+static volatile LONG g_processing = 0;
+
+// Worker 线程入口:纯 CPU 工作,不碰任何 GUI
+DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
+    auto* out = (ProcessOutput*)arg;
+
+    // 解析输入(WideToUtf8 已经在主线程做完,这里直接用 utf8 视图)
+    auto stdChars = ParseCommaSeparatedUtf8FromUtf8(out->utf8_chars);
+    auto poolMap  = ParsePoolMapUtf8FromUtf8       (out->utf8_poolMap);
+    auto stdWeps  = ParseCommaSeparatedUtf8FromUtf8(out->utf8_weps);
+
+    std::string_view bufferView((const char*)out->viewPtr, out->fileSize);
     if (bufferView.size() >= 3 &&
         (unsigned char)bufferView[0] == 0xEF &&
         (unsigned char)bufferView[1] == 0xBB &&
@@ -664,16 +830,16 @@ void ProcessFile(const std::wstring& path) {
         bufferView.remove_prefix(3);
     }
 
-    // PMR:栈上 2MB 内存池
+    // PMR:栈上 2MB 内存池(对应主线程版本的设计)。
+    // worker 线程在 ProcessFile_Submit 中以 4MB 栈创建,容得下这 2MB 缓冲区。
+    // 栈池 vs 堆池的性能差异:
+    //   - 分配/释放开销 0 (栈指针偏移 vs malloc 一次 2MB)
+    //   - 与 worker 栈的局部变量物理相邻,L1/L2 热,TLB 不会 miss
+    //   - 整个 PMR 工作集(temps + bucketChar + bucketWep) 都从此池分配,锁在热区
     std::array<std::byte, 2 * 1024 * 1024> stackBuffer;
     std::pmr::monotonic_buffer_resource pool(stackBuffer.data(), stackBuffer.size());
     std::pmr::polymorphic_allocator<std::byte> alloc(&pool);
 
-    // temps:先收集排序所需的最小字段,再分发到两个桶
-    // 终末地排序规则:
-    //   角色(id>=0) vs 武器(id<0) 天然分区,内部按 |id| 升序
-    //   (原版是 sort by |id| 不分区 —— 但实际上角色 id 为正、武器 id 为负,|id| 比较
-    //    会混淆角色和武器相对顺序。新版先按 sign 分区再比 |id|,保证同区内严格按抽卡顺序)
     struct Temp {
         long long id;
         ItemType  it;
@@ -681,6 +847,7 @@ void ProcessFile(const std::wstring& path) {
         RankType  rt;
         std::string_view name;
         std::string_view poolName;
+        uint8_t   isFree;
     };
     std::pmr::vector<Temp> temps(alloc);
     temps.reserve(6000);
@@ -690,10 +857,6 @@ void ProcessFile(const std::wstring& path) {
         RankType  rt = ParseRankType (ExtractJsonValue(itemStr, "rank_type", true));
         GachaType gt = ParseGachaType(ExtractJsonValue(itemStr, "uigf_gacha_type", true));
 
-        // 统计判定规则:
-        //   角色池:item_type=Character AND gacha_type=Special
-        //   武器池:item_type=Weapon AND gacha_type ∉ {Constant, Standard, Beginner}
-        // 不属于这两类的记录完全不需要入桶 —— 节省解析开销
         bool charPath = (it == ItemType::Character && gt == GachaType::Special);
         bool wepPath  = (it == ItemType::Weapon &&
                          gt != GachaType::Constant &&
@@ -713,16 +876,20 @@ void ProcessFile(const std::wstring& path) {
             std::from_chars(idStr.data(), idStr.data() + idStr.size(), parsed_id);
         }
 
-        temps.push_back(Temp{parsed_id, it, gt, rt, name, poolName});
+        // isFree: bool 字面量,不带引号
+        std::string_view isFreeStr = ExtractJsonValue(itemStr, "isFree", false);
+        uint8_t isFree = (isFreeStr == "true") ? 1 : 0;
+
+        temps.push_back(Temp{parsed_id, it, gt, rt, name, poolName, isFree});
     });
 
     if (temps.empty()) {
-        SetWindowTextW(hOutEdit, L"JSON 解析失败或无数据。");
-        return;
+        out->ok = false;
+        out->errMsg = L"JSON 解析失败或无数据。";
+        PostMessageW(out->hwnd_main, WM_APP_PROCESS_DONE, 0, (LPARAM)out);
+        return 0;
     }
 
-    // 排序:先按 sign(角色/武器分区),再按 |id|。
-    // 已排序检查:UIGF 文件写出时就按此规则排好,常规情况可直接跳过 sort
     auto abs_ll = [](long long v) { return v < 0 ? -v : v; };
     auto less = [&](const Temp& a, const Temp& b) {
         bool wepA = a.id < 0;
@@ -736,47 +903,42 @@ void ProcessFile(const std::wstring& path) {
     }
     if (!sorted) std::ranges::sort(temps, less);
 
-    // 分发到两个桶
     PullBucket bucketChar(alloc); bucketChar.reserve(4000);
     PullBucket bucketWep (alloc); bucketWep.reserve(2000);
     for (const auto& t : temps) {
         if (t.it == ItemType::Character && t.gt == GachaType::Special) {
-            bucketChar.push_back(t.rt, t.name, t.poolName);
-        } else {  // 武器桶(条件已在收集阶段过滤过)
-            bucketWep.push_back(t.rt, t.name, t.poolName);
+            bucketChar.push_back(t.rt, t.name, t.poolName, t.isFree);
+        } else {
+            bucketWep.push_back(t.rt, t.name, t.poolName, t.isFree);
         }
     }
 
-    statsChar = Calculate(bucketChar, /*isWeapon=*/false, stdChars, poolMap);
-    statsWep  = Calculate(bucketWep,  /*isWeapon=*/true,  stdWeps, {});
+    out->statsChar = Calculate(bucketChar, /*isWeapon=*/false, stdChars, poolMap);
+    out->statsWep  = Calculate(bucketWep,  /*isWeapon=*/true,  stdWeps, {});
 
-    // 角色池:"赢下小保底(不歪)的出货期望" — avg_win 记录的是 50/50 阶段直接出 UP 的抽数
+    // 在 worker 渲染输出文本(swprintf 是 thread-safe;只有 SetWindowTextW 不是)
     wchar_t winCharStr[64] = L"[无数据]";
-    if (statsChar.avg_win >= 0) swprintf(winCharStr, 64, L"%.2f 抽", statsChar.avg_win);
+    if (out->statsChar.avg_win >= 0)
+        swprintf(winCharStr, 64, L"%.2f 抽", out->statsChar.avg_win);
 
-    // 当前垫刀信息(右删失样本),附在输出末尾
     wchar_t pendCharStr[96] = L"";
-    if (statsChar.censored_pity_all > 0 || statsChar.censored_pity_up > 0) {
+    if (out->statsChar.censored_pity_all > 0 || out->statsChar.censored_pity_up > 0) {
         swprintf(pendCharStr, 96, L"  [当前垫刀: 距上次六星 %d 抽 / 距上次 UP %d 抽]",
-                 statsChar.censored_pity_all, statsChar.censored_pity_up);
+                 out->statsChar.censored_pity_all, out->statsChar.censored_pity_up);
     }
     wchar_t pendWepStr[96] = L"";
-    if (statsWep.censored_pity_all > 0 || statsWep.censored_pity_up > 0) {
+    if (out->statsWep.censored_pity_all > 0 || out->statsWep.censored_pity_up > 0) {
         swprintf(pendWepStr, 96, L"  [当前垫刀: 距上次六星 %d 抽 / 距上次 UP %d 抽]",
-                 statsWep.censored_pity_all, statsWep.censored_pity_up);
+                 out->statsWep.censored_pity_all, out->statsWep.censored_pity_up);
     }
 
-    // KS 标签(角色池/武器池对称):样本为 0 时显示"-",否则判定"符合/偏离"
     auto ksLabel = [](const StatsResult& r) -> const wchar_t* {
         if (r.count_all == 0) return L"-";
         return r.ks_is_normal ? L"符合理论模型" : L"偏离过大";
     };
-    const wchar_t* ksCharLabel = ksLabel(statsChar);
-    const wchar_t* ksWepLabel  = ksLabel(statsWep);
+    const wchar_t* ksCharLabel = ksLabel(out->statsChar);
+    const wchar_t* ksWepLabel  = ksLabel(out->statsWep);
 
-    // 理论参考数值:
-    //   角色池(ggpipi 模型):综合六星 ≈ 51.81 抽,首 UP ≈ 74.33 抽,不歪率 50%
-    //   武器池(Reddit 模型):首 6 星 ≈ 19.17 抽,首 UP ≈ 81.66 抽,UP 条件率 25%
     wchar_t outMsg[2560];
     swprintf(outMsg, 2560,
         L"【角色卡池 (特许寻访)】 总计六星: %d | 出当期 UP: %d%ls\r\n"
@@ -786,24 +948,101 @@ void ProcessFile(const std::wstring& path) {
         L"【武器卡池 (武库申领)】 总计六星: %d | 出当期 UP: %d%ls\r\n"
         L" ▶ 综合六星出货平均期望:             %5.2f 抽 (理论 ≈ 19.17)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
         L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 81.66)   [95%% CI: %5.1f ~ %5.1f]    |   6 星中 UP 率: %5.1f%% (理论 25%%) (%d UP / %d 非UP)",
-        statsChar.count_all, statsChar.count_up, pendCharStr,
-        statsChar.avg_all, (std::max)(1.0, statsChar.avg_all - statsChar.ci_all_err),
-        statsChar.avg_all + statsChar.ci_all_err, statsChar.cv_all * 100.0, statsChar.ks_d_all,
-        ksCharLabel,
-        statsChar.avg_up, (std::max)(1.0, statsChar.avg_up - statsChar.ci_up_err),
-        statsChar.avg_up + statsChar.ci_up_err,
-        statsChar.win_rate_5050 >= 0 ? statsChar.win_rate_5050 * 100.0 : 0.0,
-        statsChar.win_5050, statsChar.lose_5050, winCharStr,
-        statsWep.count_all, statsWep.count_up, pendWepStr,
-        statsWep.avg_all, (std::max)(1.0, statsWep.avg_all - statsWep.ci_all_err),
-        statsWep.avg_all + statsWep.ci_all_err, statsWep.cv_all * 100.0, statsWep.ks_d_all,
-        ksWepLabel,
-        statsWep.avg_up, (std::max)(1.0, statsWep.avg_up - statsWep.ci_up_err),
-        statsWep.avg_up + statsWep.ci_up_err,
-        statsWep.win_rate_5050 >= 0 ? statsWep.win_rate_5050 * 100.0 : 0.0,
-        statsWep.win_5050, statsWep.lose_5050
+        out->statsChar.count_all, out->statsChar.count_up, pendCharStr,
+        out->statsChar.avg_all, (std::max)(1.0, out->statsChar.avg_all - out->statsChar.ci_all_err),
+        out->statsChar.avg_all + out->statsChar.ci_all_err, out->statsChar.cv_all * 100.0,
+        out->statsChar.ks_d_all, ksCharLabel,
+        out->statsChar.avg_up, (std::max)(1.0, out->statsChar.avg_up - out->statsChar.ci_up_err),
+        out->statsChar.avg_up + out->statsChar.ci_up_err,
+        out->statsChar.win_rate_5050 >= 0 ? out->statsChar.win_rate_5050 * 100.0 : 0.0,
+        out->statsChar.win_5050, out->statsChar.lose_5050, winCharStr,
+        out->statsWep.count_all, out->statsWep.count_up, pendWepStr,
+        out->statsWep.avg_all, (std::max)(1.0, out->statsWep.avg_all - out->statsWep.ci_all_err),
+        out->statsWep.avg_all + out->statsWep.ci_all_err, out->statsWep.cv_all * 100.0,
+        out->statsWep.ks_d_all, ksWepLabel,
+        out->statsWep.avg_up, (std::max)(1.0, out->statsWep.avg_up - out->statsWep.ci_up_err),
+        out->statsWep.avg_up + out->statsWep.ci_up_err,
+        out->statsWep.win_rate_5050 >= 0 ? out->statsWep.win_rate_5050 * 100.0 : 0.0,
+        out->statsWep.win_5050, out->statsWep.lose_5050
     );
-    SetWindowTextW(hOutEdit, outMsg);
+    out->outMsg = outMsg;
+    out->ok = true;
+
+    PostMessageW(out->hwnd_main, WM_APP_PROCESS_DONE, 0, (LPARAM)out);
+    return 0;
+}
+
+// 主线程入口:做 I/O 准备 + 启动 worker。
+// 返回 false 表示提交失败(应立即清理),true 表示 worker 已启动(WM_APP_PROCESS_DONE
+// 会在完成时投递)。
+bool ProcessFile_Submit(HWND hwnd, const std::wstring& path) {
+    // 双开保护:用 InterlockedCompareExchange 原子地把 0->1
+    if (InterlockedCompareExchange(&g_processing, 1, 0) != 0) {
+        return false;  // 已有 worker 在跑,忽略本次拖入
+    }
+
+    auto out = std::make_unique<ProcessOutput>();
+    out->hwnd_main = hwnd;
+
+    // 主线程读 GUI 控件文本(子控件的 GetWindowTextW 不允许从 worker 调)
+    out->utf8_chars   = WideToUtf8(GetDynamicWindowText(hCharEdit));
+    out->utf8_poolMap = WideToUtf8(GetDynamicWindowText(hPoolMapEdit));
+    out->utf8_weps    = WideToUtf8(GetDynamicWindowText(hWepEdit));
+
+    // 主线程做文件 mmap,所有权直接交给 ProcessOutput(零拷贝)。
+    // mmap view 在 worker 持有期间一直有效,Consume 阶段 ProcessOutput 析构统一 unmap。
+    // 失败路径下也由 unique_ptr<ProcessOutput> 析构正确清理(已分配的资源)。
+    out->hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (out->hFile == INVALID_HANDLE_VALUE) {
+        InterlockedExchange(&g_processing, 0);
+        return false;
+    }
+    out->fileSize = GetFileSize(out->hFile, NULL);
+    if (out->fileSize == 0 || out->fileSize == INVALID_FILE_SIZE) {
+        InterlockedExchange(&g_processing, 0);
+        return false;
+    }
+    out->hMap = CreateFileMappingW(out->hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!out->hMap) {
+        InterlockedExchange(&g_processing, 0);
+        return false;
+    }
+    out->viewPtr = MapViewOfFile(out->hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!out->viewPtr) {
+        InterlockedExchange(&g_processing, 0);
+        return false;
+    }
+
+    // 启动 worker. 显式指定 4MB 栈(与主线程 /STACK:4194304 对齐;
+    // CreateThread 默认栈只 1MB,容纳不下 worker 内部的 2MB PMR 栈池)。
+    // 注意:dwStackSize 是预留+commit,Windows 实际只 commit 必要页,常驻内存仅约 1 页。
+    HANDLE hThread = CreateThread(NULL, 4 * 1024 * 1024,
+                                  ProcessFile_Worker, out.get(), 0, NULL);
+    if (!hThread) {
+        InterlockedExchange(&g_processing, 0);
+        return false;
+    }
+    CloseHandle(hThread);  // 我们用 PostMessage 同步,不需要 join
+    out.release();         // worker 接管所有权,完成时主线程在 WM_APP_PROCESS_DONE 里 delete
+    return true;
+}
+
+// 主线程消费 worker 结果. 必须在 WM_APP_PROCESS_DONE 里调用
+void ProcessFile_Consume(HWND hwnd, ProcessOutput* out) {
+    if (out->ok) {
+        // 把结果搬到全局 statsChar/statsWep (主线程独占,不需要锁)
+        statsChar = out->statsChar;
+        statsWep  = out->statsWep;
+        SetWindowTextW(hOutEdit, out->outMsg.c_str());
+        RebuildChartCache(hwnd);
+        InvalidateRect(hwnd, NULL, FALSE);
+    } else {
+        SetWindowTextW(hOutEdit,
+            out->errMsg.empty() ? L"处理失败,请检查文件格式" : out->errMsg.c_str());
+    }
+    delete out;
+    InterlockedExchange(&g_processing, 0);  // 释放双开锁
 }
 
 // -------------------------------------------------------
@@ -1170,9 +1409,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         wchar_t filePath[MAX_PATH];
         DragQueryFileW(hDrop, 0, filePath, MAX_PATH);
         DragFinish(hDrop);
-        ProcessFile(filePath);
-        RebuildChartCache(hwnd);
-        InvalidateRect(hwnd, NULL, FALSE);
+        // 异步提交;Submit 内部做双开保护(g_processing CAS 锁)
+        // 失败(已有 worker 在跑或 I/O 失败)时静默忽略,UI 上保留之前的状态
+        ProcessFile_Submit(hwnd, filePath);
+        break;
+    }
+    case WM_APP_PROCESS_DONE: {
+        // worker 完成,主线程消费结果(更新全局 stats、刷新 UI)
+        auto* out = (ProcessOutput*)lParam;
+        ProcessFile_Consume(hwnd, out);
         break;
     }
     case WM_PAINT: {
