@@ -1450,8 +1450,20 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     // 关键设计:
     //   - 综合 (蓝): 优先用理论 MRL, 否则降级到经验 MRL
     //   - UP (红):   传 useTheory=false, 只用经验 MRL (没有 UP 理论 CDF)
-    //   - 标签自动避让右边界, 加白色描边提高在彩色实线上的可读性
-    auto drawCensoredMarker = [&](int censored,
+    //   - 虚线在 X 位置画出, 但标签固定在 plot 区域右上角竖排堆叠。
+    //     避免: 标签贴虚线时碰到 X=1 这种边界情况会被裁切, 也避免红蓝标签互相重叠
+    //     (例如两个 censored 数值接近时旧逻辑会把两段文本叠在一起)。
+    //     视觉对应: 标签自带颜色, 用户能看出"蓝色标签对应蓝色虚线"。
+
+    // (1) 先画虚线, 同时收集要展示的 (text, color) 条目
+    struct CensoredLabel {
+        std::wstring text;
+        Gdiplus::Color color;
+    };
+    std::vector<CensoredLabel> censoredLabels;
+    censoredLabels.reserve(2);
+
+    auto resolveAndDrawLine = [&](int censored,
                                    const std::pair<std::array<double, 150>, std::array<int, 150>>& mrl_data,
                                    const std::array<double, 150>& tmrl,
                                    bool useTheory, int theory_cap,
@@ -1473,27 +1485,51 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         auto top = getPt(censored, y_value);
         g.DrawLine(&markPen, top.X, top.Y, top.X, plotY + plotH);
 
+        // 收集标签 (新格式: 单行, 用中点分隔; 右上角空间足够)
         wchar_t lbl[64];
-        swprintf(lbl, 64, L"已垫 %d 抽\n预期还需 %.1f 抽", censored, y_value);
-        // 边界避让: 若距右边界太近, 标签放虚线左侧
-        bool labelOnRight = (top.X < plotX + plotW * 0.7f);
-        float lblX = labelOnRight ? top.X + DPIScaleF(5.0f) : top.X - DPIScaleF(85.0f);
-        float lblY = top.Y - DPIScaleF(6.0f);
-        // 白色描边: 4 个偏移方向画白底字, 提升在彩色实线上的可读性
-        Gdiplus::SolidBrush whiteBr(Gdiplus::Color(255, 252, 253, 255));
-        for (int dx = -1; dx <= 1; dx += 2) {
-            for (int dy = -1; dy <= 1; dy += 2) {
-                g.DrawString(lbl, -1, &tickFont,
-                             Gdiplus::PointF(lblX + (float)dx, lblY + (float)dy),
-                             &whiteBr);
-            }
-        }
-        Gdiplus::SolidBrush lblBrush(color);
-        g.DrawString(lbl, -1, &tickFont,
-                     Gdiplus::PointF(lblX, lblY), &lblBrush);
+        swprintf(lbl, 64, L"已垫 %d 抽 · 预期还需 %.1f", censored, y_value);
+        censoredLabels.push_back({ std::wstring(lbl), color });
     };
-    drawCensoredMarker(censored_all, mrl_all, theory_mrl_all, true,  theory_all_cap, 65, 140, 240);
-    drawCensoredMarker(censored_up,  mrl_up,  theory_mrl_up,  false, theory_up_cap,  240, 80, 80);
+    resolveAndDrawLine(censored_all, mrl_all, theory_mrl_all, true,  theory_all_cap, 65, 140, 240);
+    resolveAndDrawLine(censored_up,  mrl_up,  theory_mrl_up,  false, theory_up_cap,  240, 80, 80);
+
+    // (2) 在 plot 区域右上角内侧固定位置堆叠标签
+    //     锚点右对齐, 行高约 14pt
+    //
+    //     垂直起点说明: Windows 端的图例画在 rect 顶部 (rect.Y+12 ~ rect.Y+60),
+    //     plot 区域起点 plotY = rect.Y+40 与图例下半部分重叠。
+    //     如果把标签放在 plotY+6 = rect.Y+46 处, 第一行会撞到图例 "综合六星 剩余期望"。
+    //     所以标签起点改为 plotY+30 ≈ rect.Y+70, 即绕开图例占据的顶部区域。
+    //     (macOS 端不需要这个偏移, 因为它的图例在 Canvas 之外的独立 ZStack 层)
+    if (!censoredLabels.empty()) {
+        Gdiplus::StringFormat fmtRight;
+        fmtRight.SetAlignment(Gdiplus::StringAlignmentFar);     // 水平右对齐
+        fmtRight.SetLineAlignment(Gdiplus::StringAlignmentNear); // 顶部对齐
+
+        Gdiplus::SolidBrush whiteBr(Gdiplus::Color(255, 252, 253, 255));
+
+        const float anchorX = plotX + plotW - DPIScaleF(6.0f);
+        const float anchorY = plotY + DPIScaleF(30.0f);   // 绕开图例占据的顶部
+        const float lineHeight = DPIScaleF(16.0f);
+
+        for (size_t i = 0; i < censoredLabels.size(); ++i) {
+            const auto& entry = censoredLabels[i];
+            float ly = anchorY + (float)i * lineHeight;
+            // 用一个点+右对齐 StringFormat 直接定位文字右上角
+            Gdiplus::PointF pt(anchorX, ly);
+            // 白色描边: 4 个对角偏移画白底字提升可读性
+            for (int dx = -1; dx <= 1; dx += 2) {
+                for (int dy = -1; dy <= 1; dy += 2) {
+                    g.DrawString(entry.text.c_str(), -1, &tickFont,
+                                 Gdiplus::PointF(pt.X + (float)dx, pt.Y + (float)dy),
+                                 &fmtRight, &whiteBr);
+                }
+            }
+            // 主文本
+            Gdiplus::SolidBrush lblBrush(entry.color);
+            g.DrawString(entry.text.c_str(), -1, &tickFont, pt, &fmtRight, &lblBrush);
+        }
+    }
 
     // ---- 图例 (3 项: 综合实线 / UP 实线 / 理论值虚线) ----
     Gdiplus::Font legendFont(&fontFamily, DPIScaleF(12.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
