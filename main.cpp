@@ -1,5 +1,5 @@
 // ============================================================
-// Endfield Gacha Exporter - UIGF v3.0 / 面向数据 / PMR 栈分配
+// Endfield Gacha Exporter - UIGF v4.2 / 面向数据 / PMR 栈分配
 // ============================================================
 #include <cstdio>
 #include <cstdlib>
@@ -409,25 +409,32 @@ int main() {
                             if (!raw_id.empty()) {
                                 std::from_chars(raw_id.data(), raw_id.data() + raw_id.size(), parsed_id);
                             }
-                            std::string_view tsStr = ExtractJsonValue(itemStr, "gachaTs", true);
+                            // UIGF v4.2: gacha_ts (原 gachaTs)
+                            std::string_view tsStr = ExtractJsonValue(itemStr, "gacha_ts", true);
                             if (!tsStr.empty()) {
                                 std::from_chars(tsStr.data(), tsStr.data() + tsStr.size(), parsed_ts);
                             }
 
                             ItemType it = ParseItemType(ExtractJsonValue(itemStr, "item_type", true));
 
+                            // UIGF v4.2: gacha_type / item_name / pool_name / weapon_type / is_new / is_free
+                            // (原: uigf_gacha_type / name / poolName / weaponType / isNew / isFree)
+                            //
+                            // ForEachJsonObject 找的是 "list" 这个 key —— v4.2 里 "list" 仅在
+                            // endfield[0] 内层出现,顶层 info 块没有 list,所以直接命中正确数组,
+                            // 不需要先穿透 endfield。
                             records.push_back(ExportRecord{
                                 parsed_id,
                                 parsed_ts,
-                                ExtractJsonValue(itemStr, "uigf_gacha_type", true),
+                                ExtractJsonValue(itemStr, "gacha_type", true),
                                 ExtractJsonValue(itemStr, "item_id", true),
-                                ExtractJsonValue(itemStr, "name", true),
+                                ExtractJsonValue(itemStr, "item_name", true),
                                 it,
                                 ExtractJsonValue(itemStr, "rank_type", true),
-                                ExtractJsonValue(itemStr, "poolName", true),
-                                ExtractJsonValue(itemStr, "weaponType", true),
-                                (uint8_t)(ExtractJsonValue(itemStr, "isNew", false)  == "true" ? 1 : 0),
-                                (uint8_t)(ExtractJsonValue(itemStr, "isFree", false) == "true" ? 1 : 0)
+                                ExtractJsonValue(itemStr, "pool_name", true),
+                                ExtractJsonValue(itemStr, "weapon_type", true),
+                                (uint8_t)(ExtractJsonValue(itemStr, "is_new",  false) == "true" ? 1 : 0),
+                                (uint8_t)(ExtractJsonValue(itemStr, "is_free", false) == "true" ? 1 : 0)
                             });
                             local_safe_ids.insert(parsed_id);
                         });
@@ -603,6 +610,28 @@ int main() {
             BufferedWriter w(hOut);
             char numBuf[32];
 
+            // ==========================================================
+            // UIGF v4.2 输出
+            // ----------------------------------------------------------
+            // 文档地址: https://uigf.org/standards/UIGF.html
+            //
+            // 终末地不在 UIGF 官方支持的游戏列表里(米哈游系: hk4e/hkrpg/nap/hk4e_ugc),
+            // 但 v4.2 schema 顶层用 "properties" 而非 "additionalProperties: false",
+            // 允许新增自定义游戏 key。我们用 "endfield" 作为终末地的容器。
+            //
+            // 顶层结构:
+            //   { "info": { ... v4.2 公共字段 ... },
+            //     "endfield": [ { "uid", "timezone", "lang", "list": [ ... ] } ] }
+            //
+            // 注意: v4.2 info 不再含 uid/lang/uigf_version,而是:
+            //   - export_timestamp / export_app / export_app_version (必需)
+            //   - version: "v4.2" (替代 uigf_version)
+            // uid/lang 下沉到游戏数组的元素里。
+            //
+            // 自定义业务字段(API 原始信息保留)统一改为 snake_case:
+            //   gacha_ts / pool_name / weapon_type / is_new / is_free
+            // ==========================================================
+
             time_t t = export_ts;
             struct tm tm_info;
             localtime_s(&tm_info, &t);
@@ -611,40 +640,63 @@ int main() {
                                  tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
                                  tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
 
+            // ---- info 块 ----
             w.WriteLit("{\n    \"info\": {\n");
-            w.WriteLit("        \"uid\": \"0\",\n        \"lang\": \"zh-cn\",\n");
-            w.WriteLit("        \"export_time\": \""); w.Write(tbuf, tlen); w.WriteLit("\",\n");
             w.WriteLit("        \"export_timestamp\": ");
             auto [ptr, ec] = std::to_chars(numBuf, numBuf + 32, export_ts);
             w.Write(numBuf, (DWORD)(ptr - numBuf));
             w.WriteLit(",\n");
             w.WriteLit("        \"export_app\": \"Endfield Exporter\",\n"
-                       "        \"export_app_version\": \"v2.4.0\",\n"
-                       "        \"uigf_version\": \"v3.0\"\n    },\n");
-            w.WriteLit("    \"list\": [\n");
+                       "        \"export_app_version\": \"v2.5.0\",\n"
+                       "        \"version\": \"v4.2\",\n");
+            // export_time 不在 v4.2 必需字段里,但保留作为人类可读辅助信息
+            w.WriteLit("        \"export_time\": \""); w.Write(tbuf, tlen); w.WriteLit("\"\n    },\n");
+
+            // ---- endfield 数组(单账号 → 单元素) ----
+            // timezone 用本地时区偏移(单位:小时)。Windows 上没有 tm_gmtoff,
+            // 用 GetTimeZoneInformation 取偏置(Bias 单位是分钟,且符号约定是
+            // "UTC = local + Bias",所以东 8 区返回 -480,需要取负再除 60)。
+            TIME_ZONE_INFORMATION tzi;
+            DWORD tzKind = GetTimeZoneInformation(&tzi);
+            LONG biasMinutes = tzi.Bias;
+            if (tzKind == TIME_ZONE_ID_DAYLIGHT) biasMinutes += tzi.DaylightBias;
+            else if (tzKind == TIME_ZONE_ID_STANDARD) biasMinutes += tzi.StandardBias;
+            int tzHours = (int)(-biasMinutes / 60);
+
+            w.WriteLit("    \"endfield\": [\n        {\n");
+            w.WriteLit("            \"uid\": \"0\",\n");
+            w.WriteLit("            \"timezone\": ");
+            auto [tzPtr, tzEc] = std::to_chars(numBuf, numBuf + 32, tzHours);
+            w.Write(numBuf, (DWORD)(tzPtr - numBuf));
+            w.WriteLit(",\n");
+            w.WriteLit("            \"lang\": \"zh-cn\",\n");
+            w.WriteLit("            \"list\": [\n");
 
             const size_t n = records.size();
             for (size_t i = 0; i < n; ++i) {
                 const auto& r = records[i];
                 w.WriteLit("        {\n");
 
-                w.WriteKV("uigf_gacha_type", r.poolId);     w.WriteLit(",\n");
+                // v4.2 标准字段:gacha_type (替代 v3.0 的 uigf_gacha_type)
+                w.WriteKV("gacha_type", r.poolId);          w.WriteLit(",\n");
                 w.WriteI64KV("id", r.safe_id, true);        w.WriteLit(",\n");
                 w.WriteKV("item_id", r.item_id);            w.WriteLit(",\n");
-                w.WriteKV("name", r.name);                  w.WriteLit(",\n");
+                // v4.2 标准字段:item_name (替代 v3.0 的 name)
+                w.WriteKV("item_name", r.name);             w.WriteLit(",\n");
                 w.WriteKV("item_type", ItemTypeToStr(r.item_type));
                 w.WriteLit(",\n");
                 w.WriteKV("rank_type", r.rank_type);        w.WriteLit(",\n");
                 w.WriteTimeKV("time", r.timestamp);         w.WriteLit(",\n");
-                w.WriteI64KV("gachaTs", r.timestamp, true); w.WriteLit(",\n");
+                // 自定义业务字段(snake_case)
+                w.WriteI64KV("gacha_ts", r.timestamp, true); w.WriteLit(",\n");
 
-                if (!r.poolName.empty())   { w.WriteKV("poolName",   r.poolName);   w.WriteLit(",\n"); }
-                if (!r.weaponType.empty()) { w.WriteKV("weaponType", r.weaponType); w.WriteLit(",\n"); }
+                if (!r.poolName.empty())   { w.WriteKV("pool_name",   r.poolName);   w.WriteLit(",\n"); }
+                if (!r.weaponType.empty()) { w.WriteKV("weapon_type", r.weaponType); w.WriteLit(",\n"); }
 
-                w.WriteLit("            \"isNew\": ");
+                w.WriteLit("            \"is_new\": ");
                 w.Write(r.isNew ? "true" : "false");
                 w.WriteLit(",\n");
-                w.WriteLit("            \"isFree\": ");
+                w.WriteLit("            \"is_free\": ");
                 w.Write(r.isFree ? "true" : "false");
                 w.WriteLit("\n");
                 w.WriteLit("        }");
@@ -652,7 +704,7 @@ int main() {
                 w.WriteLit("\n");
             }
 
-            w.WriteLit("    ]\n}\n");
+            w.WriteLit("            ]\n        }\n    ]\n}\n");
             // BufferedWriter 析构自动 Flush
         }
         CloseHandle(hOut);
