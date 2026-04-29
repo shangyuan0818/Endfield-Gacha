@@ -71,7 +71,8 @@ inline RankType ParseRankType(std::string_view sv) {
 
 inline GachaType ParseGachaType(std::string_view sv) {
     // 原版做 tolower 拷贝整串再 find —— 堆分配,删。
-    // uigf_gacha_type 字段的值实际就是上面几个枚举字符串,大小写不敏感匹配即可
+    // gacha_type 字段的值实际就是上面几个枚举字符串,大小写不敏感匹配即可
+    // (UIGF v4.2: 字段名为 gacha_type;v3.0 时叫 uigf_gacha_type)
     if (ContainsCI(sv, "special"))  return GachaType::Special;
     if (ContainsCI(sv, "beginner")) return GachaType::Beginner;
     if (ContainsCI(sv, "standard")) return GachaType::Standard;
@@ -837,9 +838,18 @@ DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
     temps.reserve(6000);
 
     ForEachJsonObject(bufferView, "list", [&](std::string_view itemStr) {
-        ItemType  it = ParseItemType (ExtractJsonValue(itemStr, "item_type", true));
-        RankType  rt = ParseRankType (ExtractJsonValue(itemStr, "rank_type", true));
-        GachaType gt = ParseGachaType(ExtractJsonValue(itemStr, "uigf_gacha_type", true));
+        // UIGF v4.2 字段读取:
+        //   - gacha_type   (替代 v3.0 的 uigf_gacha_type)
+        //   - item_name    (替代 v3.0 的 name)
+        //   - pool_name    (自定义,snake_case;原 poolName)
+        //   - is_free      (自定义,snake_case;原 isFree)
+        //
+        // ForEachJsonObject 找的是 "list" 这个 key。v4.2 文件里 "list" 只
+        // 在 endfield[0] 内层出现一次(顶层 info 块没有 list),所以不需要
+        // 先穿透 endfield 数组,直接找到的就是正确的记录数组。
+        ItemType  it = ParseItemType (ExtractJsonValue(itemStr, "item_type",  true));
+        RankType  rt = ParseRankType (ExtractJsonValue(itemStr, "rank_type",  true));
+        GachaType gt = ParseGachaType(ExtractJsonValue(itemStr, "gacha_type", true));
 
         bool charPath = (it == ItemType::Character && gt == GachaType::Special);
         bool wepPath  = (it == ItemType::Weapon &&
@@ -848,10 +858,8 @@ DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
                          gt != GachaType::Beginner);
         if (!charPath && !wepPath) return;
 
-        std::string_view name = ExtractJsonValue(itemStr, "name", true);
-        std::string_view poolName = ExtractJsonValue(itemStr, "poolName", true);
-        if (poolName.empty()) poolName = ExtractJsonValue(itemStr, "gacha_name", true);
-        if (poolName.empty()) poolName = ExtractJsonValue(itemStr, "poolname",   true);
+        std::string_view name = ExtractJsonValue(itemStr, "item_name", true);
+        std::string_view poolName = ExtractJsonValue(itemStr, "pool_name", true);
 
         std::string_view idStr = ExtractJsonValue(itemStr, "id", true);
         if (idStr.empty()) idStr = ExtractJsonValue(itemStr, "id", false);
@@ -860,8 +868,8 @@ DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
             std::from_chars(idStr.data(), idStr.data() + idStr.size(), parsed_id);
         }
 
-        // isFree: bool 字面量,不带引号
-        std::string_view isFreeStr = ExtractJsonValue(itemStr, "isFree", false);
+        // is_free: bool 字面量,不带引号
+        std::string_view isFreeStr = ExtractJsonValue(itemStr, "is_free", false);
         uint8_t isFree = (isFreeStr == "true") ? 1 : 0;
 
         temps.push_back(Temp{parsed_id, it, gt, rt, name, poolName, isFree});
@@ -1203,31 +1211,65 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         }
     }
 
-    // 图例 (3 项: 综合实线 / UP 实线 / 理论 CDF 虚线)
+    // 图例 (3 项水平排列: 综合实线 / UP 实线 / 理论 CDF 虚线)
+    // 与 macOS / iOS 端布局对齐 —— 标题旁同一行,从右向左排,
+    // 这样图例完全位于标题区(rect.Y+12 行),不会下沉到绘图区(rect.Y+40 起)。
+    // 旧版图例垂直堆叠 3 行,最下面一项会落进绘图区与曲线重叠。
     Gdiplus::Font legendFont(&fontFamily, DPIScaleF(12.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::SolidBrush blueBr(Gdiplus::Color(255, 65, 140, 240));
     Gdiplus::SolidBrush redBr (Gdiplus::Color(255, 240, 80, 80));
-    Gdiplus::SolidBrush grayBr(Gdiplus::Color(255, 130, 130, 130));
-    float legendX = (float)rect.X + (float)rect.Width - DPIScaleF(220.0f);
-    float legendY = (float)rect.Y + DPIScaleF(12.0f);
-    // 第 1 行: 综合 ECDF (实线色块)
-    g.FillRectangle(&blueBr, legendX, legendY + DPIScaleF(4.0f), DPIScaleF(14.0f), DPIScaleF(3.0f));
-    g.DrawString(L"━ 综合六星 ECDF", -1, &legendFont,
-                 Gdiplus::PointF(legendX + DPIScaleF(20.0f), legendY - DPIScaleF(2.0f)), &textBrush);
-    // 第 2 行: UP ECDF (实线色块)
-    g.FillRectangle(&redBr, legendX, legendY + DPIScaleF(20.0f), DPIScaleF(14.0f), DPIScaleF(3.0f));
-    g.DrawString(L"━ 当期限定 UP ECDF", -1, &legendFont,
-                 Gdiplus::PointF(legendX + DPIScaleF(20.0f), legendY + DPIScaleF(14.0f)), &textBrush);
-    // 第 3 行: 理论 CDF (虚线色块, 用 dash pen 画两小段)
+
+    // 三个图例项的文字(色块在前,文字在后)
+    const wchar_t* legAll  = L"综合六星 ECDF";
+    const wchar_t* legUp   = L"当期限定 UP ECDF";
+    const wchar_t* legThy  = L"理论 CDF (综合)";
+
+    // 测量文字宽度,精确从右排 —— 不能用固定常量,因为不同字体/DPI 下宽度不同
+    auto measureW = [&](const wchar_t* s) -> float {
+        Gdiplus::RectF box;
+        g.MeasureString(s, -1, &legendFont, Gdiplus::PointF(0, 0), &box);
+        return box.Width;
+    };
+    const float swatchW    = DPIScaleF(14.0f);  // 实线/虚线色块宽度
+    const float swatchGap  = DPIScaleF(6.0f);   // 色块到文字间距
+    const float entryGap   = DPIScaleF(16.0f);  // 项与项之间间距
+    const float legendY    = (float)rect.Y + DPIScaleF(12.0f);
+    const float swatchYOff = DPIScaleF(8.0f);   // 色块在图例行内的垂直居中偏移
+
+    // 从右往左:Theory(虚线) → UP → All
+    float wAll  = measureW(legAll);
+    float wUp   = measureW(legUp);
+    float wThy  = measureW(legThy);
+    float xRight = (float)rect.X + (float)rect.Width - DPIScaleF(12.0f);
+
+    // 第 3 项: 理论 CDF (虚线,最右)
+    float xThyText = xRight - wThy;
+    float xThySw   = xThyText - swatchGap - swatchW;
     {
         Gdiplus::Pen dashPen(Gdiplus::Color(255, 130, 130, 130), DPIScaleF(1.5f));
         Gdiplus::REAL dash[2] = { DPIScaleF(2.5f), DPIScaleF(2.0f) };
         dashPen.SetDashPattern(dash, 2);
-        float ly = legendY + DPIScaleF(36.0f);
-        g.DrawLine(&dashPen, legendX, ly + DPIScaleF(4.0f), legendX + DPIScaleF(14.0f), ly + DPIScaleF(4.0f));
-        g.DrawString(L"- - 理论 CDF (综合)", -1, &legendFont,
-                     Gdiplus::PointF(legendX + DPIScaleF(20.0f), ly - DPIScaleF(2.0f)), &textBrush);
+        g.DrawLine(&dashPen, xThySw, legendY + swatchYOff,
+                   xThySw + swatchW, legendY + swatchYOff);
     }
+    g.DrawString(legThy, -1, &legendFont,
+                 Gdiplus::PointF(xThyText, legendY), &textBrush);
+
+    // 第 2 项: UP ECDF
+    float xUpText = xThySw - entryGap - wUp;
+    float xUpSw   = xUpText - swatchGap - swatchW;
+    g.FillRectangle(&redBr, xUpSw, legendY + swatchYOff - DPIScaleF(1.5f),
+                    swatchW, DPIScaleF(3.0f));
+    g.DrawString(legUp, -1, &legendFont,
+                 Gdiplus::PointF(xUpText, legendY), &textBrush);
+
+    // 第 1 项: 综合 ECDF
+    float xAllText = xUpSw - entryGap - wAll;
+    float xAllSw   = xAllText - swatchGap - swatchW;
+    g.FillRectangle(&blueBr, xAllSw, legendY + swatchYOff - DPIScaleF(1.5f),
+                    swatchW, DPIScaleF(3.0f));
+    g.DrawString(legAll, -1, &legendFont,
+                 Gdiplus::PointF(xAllText, legendY), &textBrush);
 }
 
 // ---------------------------------------------------------
@@ -1496,11 +1538,8 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     // (2) 在 plot 区域右上角内侧固定位置堆叠标签
     //     锚点右对齐, 行高约 14pt
     //
-    //     垂直起点说明: Windows 端的图例画在 rect 顶部 (rect.Y+12 ~ rect.Y+60),
-    //     plot 区域起点 plotY = rect.Y+40 与图例下半部分重叠。
-    //     如果把标签放在 plotY+6 = rect.Y+46 处, 第一行会撞到图例 "综合六星 剩余期望"。
-    //     所以标签起点改为 plotY+30 ≈ rect.Y+70, 即绕开图例占据的顶部区域。
-    //     (macOS 端不需要这个偏移, 因为它的图例在 Canvas 之外的独立 ZStack 层)
+    //     图例改为水平横排后只占 rect.Y+12 那一行 (与 macOS/iOS 一致),
+    //     不再下沉到绘图区,所以标签可以从 plotY+6 紧贴绘图区顶部起步。
     if (!censoredLabels.empty()) {
         Gdiplus::StringFormat fmtRight;
         fmtRight.SetAlignment(Gdiplus::StringAlignmentFar);     // 水平右对齐
@@ -1509,7 +1548,7 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         Gdiplus::SolidBrush whiteBr(Gdiplus::Color(255, 252, 253, 255));
 
         const float anchorX = plotX + plotW - DPIScaleF(6.0f);
-        const float anchorY = plotY + DPIScaleF(30.0f);   // 绕开图例占据的顶部
+        const float anchorY = plotY + DPIScaleF(6.0f);
         const float lineHeight = DPIScaleF(16.0f);
 
         for (size_t i = 0; i < censoredLabels.size(); ++i) {
@@ -1531,27 +1570,61 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         }
     }
 
-    // ---- 图例 (3 项: 综合实线 / UP 实线 / 理论值虚线) ----
+    // ---- 图例 (3 项水平排列: 综合实线 / UP 实线 / 理论值虚线) ----
+    // 与 macOS / iOS 端布局对齐 —— 标题旁同一行,从右向左排,
+    // 这样图例完全位于标题区(rect.Y+12 行),不会下沉到绘图区(rect.Y+40 起)。
     Gdiplus::Font legendFont(&fontFamily, DPIScaleF(12.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     Gdiplus::SolidBrush blueBr(Gdiplus::Color(255, 65, 140, 240));
     Gdiplus::SolidBrush redBr (Gdiplus::Color(255, 240, 80, 80));
-    float legendX = (float)rect.X + (float)rect.Width - DPIScaleF(220.0f);
-    float legendY = (float)rect.Y + DPIScaleF(12.0f);
-    g.FillRectangle(&blueBr, legendX, legendY + DPIScaleF(4.0f), DPIScaleF(14.0f), DPIScaleF(3.0f));
-    g.DrawString(L"━ 综合六星 剩余期望", -1, &legendFont,
-                 Gdiplus::PointF(legendX + DPIScaleF(20.0f), legendY - DPIScaleF(2.0f)), &textBrush);
-    g.FillRectangle(&redBr, legendX, legendY + DPIScaleF(20.0f), DPIScaleF(14.0f), DPIScaleF(3.0f));
-    g.DrawString(L"━ 当期限定 UP 剩余期望", -1, &legendFont,
-                 Gdiplus::PointF(legendX + DPIScaleF(20.0f), legendY + DPIScaleF(14.0f)), &textBrush);
+
+    const wchar_t* legAll  = L"综合六星 剩余期望";
+    const wchar_t* legUp   = L"当期限定 UP 剩余期望";
+    const wchar_t* legThy  = L"理论值 (综合)";
+
+    auto measureW = [&](const wchar_t* s) -> float {
+        Gdiplus::RectF box;
+        g.MeasureString(s, -1, &legendFont, Gdiplus::PointF(0, 0), &box);
+        return box.Width;
+    };
+    const float swatchW    = DPIScaleF(14.0f);
+    const float swatchGap  = DPIScaleF(6.0f);
+    const float entryGap   = DPIScaleF(16.0f);
+    const float legendY    = (float)rect.Y + DPIScaleF(12.0f);
+    const float swatchYOff = DPIScaleF(8.0f);
+
+    float wAll  = measureW(legAll);
+    float wUp   = measureW(legUp);
+    float wThy  = measureW(legThy);
+    float xRight = (float)rect.X + (float)rect.Width - DPIScaleF(12.0f);
+
+    // 第 3 项: 理论值 (虚线,最右)
+    float xThyText = xRight - wThy;
+    float xThySw   = xThyText - swatchGap - swatchW;
     {
         Gdiplus::Pen dashPen(Gdiplus::Color(255, 130, 130, 130), DPIScaleF(1.5f));
         Gdiplus::REAL dash[2] = { DPIScaleF(2.5f), DPIScaleF(2.0f) };
         dashPen.SetDashPattern(dash, 2);
-        float ly = legendY + DPIScaleF(36.0f);
-        g.DrawLine(&dashPen, legendX, ly + DPIScaleF(4.0f), legendX + DPIScaleF(14.0f), ly + DPIScaleF(4.0f));
-        g.DrawString(L"- - 理论值 (综合)", -1, &legendFont,
-                     Gdiplus::PointF(legendX + DPIScaleF(20.0f), ly - DPIScaleF(2.0f)), &textBrush);
+        g.DrawLine(&dashPen, xThySw, legendY + swatchYOff,
+                   xThySw + swatchW, legendY + swatchYOff);
     }
+    g.DrawString(legThy, -1, &legendFont,
+                 Gdiplus::PointF(xThyText, legendY), &textBrush);
+
+    // 第 2 项: UP 剩余期望
+    float xUpText = xThySw - entryGap - wUp;
+    float xUpSw   = xUpText - swatchGap - swatchW;
+    g.FillRectangle(&redBr, xUpSw, legendY + swatchYOff - DPIScaleF(1.5f),
+                    swatchW, DPIScaleF(3.0f));
+    g.DrawString(legUp, -1, &legendFont,
+                 Gdiplus::PointF(xUpText, legendY), &textBrush);
+
+    // 第 1 项: 综合剩余期望
+    float xAllText = xUpSw - entryGap - wAll;
+    float xAllSw   = xAllText - swatchGap - swatchW;
+    g.FillRectangle(&blueBr, xAllSw, legendY + swatchYOff - DPIScaleF(1.5f),
+                    swatchW, DPIScaleF(3.0f));
+    g.DrawString(legAll, -1, &legendFont,
+                 Gdiplus::PointF(xAllText, legendY), &textBrush);
 }
 
 void RebuildChartCache(HWND hwnd) {
