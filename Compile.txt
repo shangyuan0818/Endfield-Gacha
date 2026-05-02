@@ -1,3 +1,5 @@
+Prerequisites: MSVC (Visual Studio Build Tools), run in "Developer Command Prompt"
+
 For exporter:
 
 cl /O2 /GL /EHsc /std:c++20 /utf-8 /DUNICODE /D_UNICODE /MT main.cpp user32.lib winhttp.lib /link /SUBSYSTEM:CONSOLE /OPT:REF /OPT:ICF /LTCG /STACK:4194304
