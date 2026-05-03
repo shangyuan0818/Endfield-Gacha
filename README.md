@@ -38,4 +38,4 @@ Gacha tracker and visualizer for Arknights: Endfield. Built with C++20 &amp; Win
 
 
 ## Demonstration 效果展示
-<img width="1924" height="1397" alt="image" src="https://github.com/user-attachments/assets/0ad6b92e-bb0b-47f8-9950-3262947d7321" />
+<img width="1924" height="1397" alt="image" src="https://github.com/user-attachments/assets/d3f93f21-40cf-4e7d-8922-a0a70d669fc6" />
