@@ -1,5 +1,5 @@
 // ============================================================
-// Endfield Gacha Exporter - UIGF v4.2 / 面向数据 / PMR 栈分配
+// Endfield Gacha Exporter - UIGF v3.0 / 面向数据 / PMR 栈分配
 // ============================================================
 #include <cstdio>
 #include <cstdlib>
@@ -349,6 +349,7 @@ int main() {
 
     std::vector<PoolConfig> pools = {
         {"E_CharacterGachaPoolType_Special",  "角色 - 特许寻访", false},
+        {"E_CharacterGachaPoolType_Joint",    "角色 - 辉光庆典", false},
         {"E_CharacterGachaPoolType_Standard", "角色 - 基础寻访", false},
         {"E_CharacterGachaPoolType_Beginner", "角色 - 启程寻访", false},
         {"",                                   "武器 - 全历史记录", true}
@@ -647,7 +648,7 @@ int main() {
             w.Write(numBuf, (DWORD)(ptr - numBuf));
             w.WriteLit(",\n");
             w.WriteLit("        \"export_app\": \"Endfield Exporter\",\n"
-                       "        \"export_app_version\": \"v2.5.0\",\n"
+                       "        \"export_app_version\": \"v2.6.0\",\n"
                        "        \"version\": \"v4.2\",\n");
             // export_time 不在 v4.2 必需字段里,但保留作为人类可读辅助信息
             w.WriteLit("        \"export_time\": \""); w.Write(tbuf, tlen); w.WriteLit("\"\n    },\n");
