@@ -1774,9 +1774,22 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
                             BYTE r, BYTE gC, BYTE b,
                             KSLabelAnchor anchor) {
         if (total == 0 || !cdf || cdf_len < 2) return;
+        // v0.1.2.4: 同 drawTheoryCDF / computeTheoryMRL, 加 upper_eff 截断避免:
+        //   - 辉光池 cdf[241]=0 (未填充哨兵段) 让 |cum - 0| ≈ 1, 误判为最大偏离点
+        //   - 饱和段 (cdf[k]==1 after hard pity) 上做无意义的比较
+        // 注: 此截断在 v0.1.2.2 已加到 drawTheoryCDF 和 computeTheoryMRL, 但当时漏掉
+        // drawKSMarker, 直到 v0.1.2.4 才补齐.
+        constexpr double EPS_SAT = 1e-6;
+        int upper_scan = (cdf_len - 1 < max_x) ? cdf_len - 1 : max_x;
+        int upper_eff = upper_scan;
+        for (int k = 1; k <= upper_scan; ++k) {
+            if (cdf[k] >= 1.0 - EPS_SAT) { upper_eff = k; break; }
+            if (cdf[k] + EPS_SAT < cdf[k - 1]) { upper_eff = k - 1; break; }
+        }
+        if (upper_eff < 1) return;
         double max_d = 0; int max_d_x = 0;
         double cum = 0;
-        for (int k = 1; k <= max_x && k < cdf_len; ++k) {
+        for (int k = 1; k <= upper_eff; ++k) {
             cum += (double)freq[k] / (double)total;
             double d = std::fabs(cum - cdf[k]);
             if (d > max_d) { max_d = d; max_d_x = k; }
@@ -2348,7 +2361,7 @@ void RebuildChartCache(HWND hwnd) {
                    statsChar.count_all, statsChar.count_up,
                    statsChar.censored_pity_all, statsChar.censored_pity_up,
                    g_cdf_char, 82, g_cdf_char_up, 122,
-                   L"角色 (特许) 累积分布 (ECDF)", 120,
+                   L"角色 (特许寻访) 累积分布 (ECDF)", 120,
                    /*ecdf_up_step_size=*/1);
         // 角色 MRL: X=80 是综合 6 星硬保底 (理论 MRL 上限), X=120 是 UP 硬保底
         DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(390), DPIScale(600), DPIScale(250)),
@@ -2356,7 +2369,7 @@ void RebuildChartCache(HWND hwnd) {
                    statsChar.count_all, statsChar.count_up,
                    statsChar.censored_pity_all, statsChar.censored_pity_up,
                    g_cdf_char, 82, g_cdf_char_up, 122,
-                   L"角色 (特许) 剩余抽数期望 (MRL)", 120,
+                   L"角色 (特许寻访) 剩余抽数期望 (MRL)", 120,
                    /*theory_all_cap=*/80, /*theory_up_cap=*/120);
 
         // ===== 辉光庆典 (Joint) =====
