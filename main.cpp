@@ -1,5 +1,5 @@
 // ============================================================
-// Endfield Gacha Exporter - UIGF v3.0 / 面向数据 / PMR 栈分配
+// Endfield Gacha Exporter - UIGF v4.2 / 面向数据 / PMR 栈分配
 // ============================================================
 #include <cstdio>
 #include <cstdlib>
