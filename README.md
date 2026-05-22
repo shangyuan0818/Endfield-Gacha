@@ -33,9 +33,9 @@ Gacha tracker and visualizer for Arknights: Endfield. Built with C++20 &amp; Win
 - **CPU 处理器**: x86, x86_64, and arm64 (32-bit and 64-bit / 32位 与 64位)
 
 > ### Apple (macOS &amp; iOS)
-> Please check the Apple SwiftUI version here 请查看该SwiftUI版本: [Endfield-Gacha-Apple](https://github.com/shangyuan0818/Endfield-Gacha-Apple)
+> Please check the Swift 6 version here 请查看该 Swift 6 版本: [Endfield-Gacha-Apple](https://github.com/shangyuan0818/Endfield-Gacha-Apple)
 
 
 
 ## Demonstration 效果展示
-<img width="1924" height="1397" alt="image" src="https://github.com/user-attachments/assets/d3f93f21-40cf-4e7d-8922-a0a70d669fc6" />
+<img width="947" height="901" alt="image" src="https://github.com/user-attachments/assets/8b0b6ce0-3a82-4b78-97e1-f5834a151d90" />
