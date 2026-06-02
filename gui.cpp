@@ -480,28 +480,29 @@ void InitCDFTables() {
     }
 
     // ---- 角色池 UP 理论 CDF (g_cdf_char_up[0..120]) ----
-    // 真实双状态模型 (v0.1.2.2, 替换原 v0.1.1 的 50/50 简化):
-    //   D[s][h]: 水位 s ∈ [0,79], 大保底标志 h ∈ {0,1}
-    //     s = 距上次出 6 星的抽数 (0 表示刚出过 6 星)
-    //     h = had_non_up: 上一次出 6 星是否歪 (是的话下次必中 UP)
+    // 真实模型 (v0.1.3.0, 修正 v0.1.2.2 的“歪→下次必中”大保底错误):
+    //   终末地特许寻访【没有原神/米池式大保底】: 小保底歪了之后, 下一次出六星仍是
+    //   独立 50/50, 可以连续歪多次。唯一的 UP 兜底是【120 抽硬保底】(本期累计 120 抽
+    //   必出 UP), 且 120 计数每期独立、不继承 (官方机制说明 + Wanuxi: “系统只在 120 抽
+    //   触发保底, 这与一些同类游戏不同 —— 那些游戏小保底失败后下次必中”)。
+    //   => 状态退化为单维 D[s] (与辉光池 g_cdf_joint_up 同构), 唯一差别是本池在
+    //      n=120 强制所有“尚未出 UP”的存活者毕业 (辉光池无此硬保底)。
+    //   D[s]: 水位 s ∈ [0,79] = 距上次出 6 星的抽数, 概率质量 = “尚未出 UP” 的人群。
     //   每抽:
-    //     - hazard ph = h_char(s+1)
-    //     - 不出货: 概率 D[s][h] × (1-ph), 转入 newD[s+1][h]
-    //     - 出货 (含 had_non_up 大保底):
-    //       h==0: 50% 毕业 (累计 cum) + 50% 歪了 → newD[0][1]
-    //       h==1: 100% 毕业 (大保底必中 UP)
-    //   n=30 特殊: 展开成 11 次独立判定 (1 次本体抽 + 10 次免费十连)
-    //     本体抽:  水位推进 (s → s+1), 不出货水位+1, 出货水位归 0 (但已毕业)
-    //     免费十连: 水位停在当前 s (经验代码 line 836 `if (!isFree) current_pity = 0`,
-    //               isFree 出货不重置水位; 注意 isFree 出 UP 也按"水位停"处理)
-    //     每次独立 hazard 0.008 (= h_char(s+1) 当 s+1 在软保底前段)
-    //     50/50 + had_non_up 大保底语义在 11 次内部正确传播
-    //   n=120 硬保底: 所有存活全部出货 (h==0 仍按 50/50, h==1 100% 毕业)
+    //     - 不出货: 概率 D[s]×(1-ph) → newD[s+1]
+    //     - 出货 (独立 50/50): 50% 毕业(出 UP, 计入 cum);
+    //                          50% 歪(水位归 0, 仍未出 UP → newD[0])
+    //   n=30 特殊: 展开 11 次独立判定 (本体抽推进水位; 免费十连水位停, isFree 出货
+    //              不重置水位; 与辉光池/经验代码一致)。
+    //   n=120 硬保底: 所有存活者 (任意水位) 强制出 UP。
     //
-    // 历史: v0.1.1 用单维 D[s] + 50/50 简化, E[首 UP] ≈ 81.4 抽 (偏差 7 抽),
-    //        且 n=30 处只用 h_char(30)=0.008 单次判定, 不体现免费十连. 视觉上
-    //        经验 ECDF 在 X=30 处有跳跃 (slot_up=30), 但理论 CDF 几乎不跳, 对不齐.
-    //        新模型 E[首 UP] ≈ 74.16, 与社区 ≈74.33 吻合, n=30 处跳跃也对齐经验.
+    // 历史: v0.1.2.2 用二维 D[s][h] (h=大保底标志) 实现“歪→下次必中 UP”, 是把终末地
+    //        误当成原神/米池模型。经联网核实, 终末地特许寻访【不存在】该大保底。
+    //        该错误后果: E[首 UP] 偏低 (~74.16 vs 真值 ~79.29 原始抽), 120 硬保底
+    //        触发率被低估 (~20.8% vs ~32.8%), 长尾 (80~119 段) 理论 CDF 系统性偏高
+    //        约 0.12 (K-S 量级)。另注: 旧标注“理论≈74.33”其实是【净成本】(扣前 5 抽
+    //        免费), 原始抽数真值 = 74.33+5 ≈ 79.29, 正好与本修正模型一致 ——
+    //        当年错误模型给的 74.16 数值上贴近 74.33, 掩盖了 bug (拿原始抽对净成本)。
     {
         constexpr int hard_cap = 120;
         constexpr int max_soft = 80;
@@ -510,94 +511,59 @@ void InitCDFTables() {
             else if (k <= 79) return 0.058 + (k - 66) * 0.05;
             else              return 1.0;
         };
-        // D[s][h]: 二维状态. h=0 即 had_non_up=false (50/50 状态), h=1 即"歪过, 下次必中"
-        double D[max_soft][2] = {};
-        D[0][0] = 1.0;
+        // 单维状态: D[s] = 水位 s 且“尚未出 UP”的概率 (无大保底标志, 每次出货独立 50/50)
+        std::array<double, max_soft> D{}; D[0] = 1.0;
         double cum = 0.0;
         for (int n = 1; n <= hard_cap; ++n) {
             if (n == hard_cap) {
-                // 硬保底: 所有存活全部出货. h==0 仍 50/50, h==1 全毕业
-                double alive_grad = 0.0;
-                for (int s = 0; s < max_soft; ++s) {
-                    alive_grad += D[s][0] * 0.5 + D[s][1] * 1.0;
-                }
-                cum += alive_grad;
+                // 120 硬保底: 所有“尚未出 UP”的存活者 (任意水位) 强制出 UP
+                double alive = 0.0;
+                for (int s = 0; s < max_soft; ++s) alive += D[s];
+                cum += alive;
                 g_cdf_char_up[n] = (std::min)(1.0, cum);
                 for (int k = n + 1; k <= hard_cap + 1; ++k) g_cdf_char_up[k] = 1.0;
                 break;
             }
 
-            double newD[max_soft][2] = {};
-            double p_hit_grad = 0.0;  // 此 step 总毕业概率
+            std::array<double, max_soft> newD{};
+            double p_hit_grad = 0.0;
 
             if (n == 30) {
-                // ===== n=30: 11 次独立判定 (本体抽 + 免费十连 10 次) =====
-                // 本体抽 (1 次, 水位推进)
-                double stateA[max_soft][2] = {};
+                // ===== n=30: 11 次独立判定 (本体抽 1 次 + 免费十连 10 次) =====
+                std::array<double, max_soft> stateA{};
                 for (int s = 0; s < max_soft; ++s) {
-                    for (int h = 0; h < 2; ++h) {
-                        if (D[s][h] == 0) continue;
-                        double ph = h_char(s + 1);
-                        // 不出货: 水位 s+1
-                        if (s + 1 < max_soft) {
-                            stateA[s + 1][h] += D[s][h] * (1.0 - ph);
-                        }
-                        // 出货
-                        if (h == 0) {
-                            p_hit_grad   += D[s][h] * ph * 0.5;      // 毕业
-                            stateA[0][1] += D[s][h] * ph * 0.5;      // 歪了, 水位归 0 (本体抽非 isFree)
-                        } else {
-                            p_hit_grad   += D[s][h] * ph * 1.0;      // 大保底, 全毕业
-                        }
-                    }
+                    if (D[s] == 0) continue;
+                    double ph = h_char(s + 1);
+                    if (s + 1 < max_soft) stateA[s + 1] += D[s] * (1.0 - ph);
+                    p_hit_grad += D[s] * ph * 0.5;   // 毕业 (出 UP)
+                    stateA[0]  += D[s] * ph * 0.5;   // 歪, 水位归 0 (本体抽), 仍未出 UP
                 }
-
-                // 免费十连 10 次 (水位不推进, hazard 仍按 h_char(s+1) 算)
-                // 注意: 此时 survivors 的水位 s 应该已经 = 30 (本体抽推进过), 但代码对所有 s 通用
                 for (int free_step = 0; free_step < 10; ++free_step) {
-                    double newStateA[max_soft][2] = {};
+                    std::array<double, max_soft> newStateA{};
                     for (int s = 0; s < max_soft; ++s) {
-                        for (int h = 0; h < 2; ++h) {
-                            if (stateA[s][h] == 0) continue;
-                            double ph = h_char(s + 1);
-                            // 不出货: 水位停 (isFree 不推进)
-                            newStateA[s][h] += stateA[s][h] * (1.0 - ph);
-                            // 出货: 水位停 (isFree 出货也不重置)
-                            if (h == 0) {
-                                p_hit_grad       += stateA[s][h] * ph * 0.5;
-                                newStateA[s][1]  += stateA[s][h] * ph * 0.5;  // 歪了, 水位停
-                            } else {
-                                p_hit_grad       += stateA[s][h] * ph * 1.0;
-                            }
-                        }
+                        if (stateA[s] == 0) continue;
+                        double ph = h_char(s + 1);
+                        newStateA[s] += stateA[s] * (1.0 - ph);   // 不出货, 水位停
+                        p_hit_grad   += stateA[s] * ph * 0.5;     // 毕业 (出 UP)
+                        newStateA[s] += stateA[s] * ph * 0.5;     // 歪, 水位停 (isFree)
                     }
-                    std::memcpy(stateA, newStateA, sizeof(stateA));
+                    stateA = newStateA;
                 }
-
-                // 11 次结束, stateA 写回 newD
-                std::memcpy(newD, stateA, sizeof(newD));
+                newD = stateA;
             } else {
                 // ===== 普通抽 =====
                 for (int s = 0; s < max_soft; ++s) {
-                    for (int h = 0; h < 2; ++h) {
-                        if (D[s][h] == 0) continue;
-                        double ph = h_char(s + 1);
-                        if (s + 1 < max_soft) {
-                            newD[s + 1][h] += D[s][h] * (1.0 - ph);
-                        }
-                        if (h == 0) {
-                            p_hit_grad   += D[s][h] * ph * 0.5;
-                            newD[0][1]   += D[s][h] * ph * 0.5;
-                        } else {
-                            p_hit_grad   += D[s][h] * ph * 1.0;
-                        }
-                    }
+                    if (D[s] == 0) continue;
+                    double ph = h_char(s + 1);
+                    if (s + 1 < max_soft) newD[s + 1] += D[s] * (1.0 - ph);
+                    p_hit_grad += D[s] * ph * 0.5;   // 毕业 (出 UP)
+                    newD[0]    += D[s] * ph * 0.5;   // 歪, 水位归 0, 仍未出 UP
                 }
             }
 
             cum += p_hit_grad;
             g_cdf_char_up[n] = (std::min)(1.0, cum);
-            std::memcpy(D, newD, sizeof(D));
+            D = newD;
         }
     }
 
@@ -938,14 +904,17 @@ inline double SampleVariance(long long sum, long long sum_sq, int n) {
 // 统计核心 - bucket 已只含目标池子,无需 filter
 //
 // 注意:武器池与角色池的"UP 判定"语义不同:
-//   - 角色池 (Special):出 6 星后有 50/50,歪了则下一个六星保底 UP("大保底")
-//   - 武器池:每个六星独立判定 UP(条件概率 25%),无"大保底"。
-//             连续 7 次十连无 UP 触发"80 抽 UP 保底十连"强制 UP。
+//   - 角色池 (Special):每个 6 星独立 50/50, 无大保底(歪了下次【不】保证 UP); 唯一兜底是
+//             120 抽硬保底(每期独立、不继承): 本期 119 抽未出 UP 则第 120 抽强制 UP。
+//   - 武器池:每个六星独立判定 UP(条件概率 25%),无“歪→下次必中”。
+//             唯一兜底是 80 抽(8 申领)限定硬保底:连续 7 次十连(70 抽)无 UP,第 8 次
+//             十连(第 71~80 抽)强制出当期限定。40 小保底 + 80 硬保底每期独立重算、均不继承。
 //   - 角色池 (Joint, 辉光庆典): 4 个 6 星都是限定角色, 其中 2 个同时也在常驻
 //             名单 (本期: 艾尔黛拉/骏卫)。"UP" 定义 = 不在常驻名单中的 = 真·限定
 //             (本期: 莱万汀/洁尔佩塔)。物理上 4 个均匀分布 → P(UP|6星) = 2/4 = 50%
 //             与 Special 池的 50/50 歪率数值上重合,所以理论 CDF 直接复用
-//             g_cdf_char / g_cdf_char_up (机制本身又是与 Special 一致: 0.8% 基础,
+//             g_cdf_char; 限定(UP) CDF 用专建 g_cdf_joint_up (辉光池无 120 硬保底, 不复用
+//             已加硬保底的 g_cdf_char_up; 机制与 Special 一致: 0.8% 基础,
 //             k=66 起软保底, k=80 硬保底, 第 30 抽赠送十连)
 // 因此 win_5050/lose_5050/avg_win 这组变量:
 //   - Special / Joint:对应"小保底不歪率",统计意义明确
@@ -964,7 +933,19 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
                      bool isJoint = false) {
     StatsAccumulator acc;
     int current_pity = 0, pity_since_last_up = 0;
-    bool had_non_up = false;  // 仅用于角色池的小保底追踪
+    // 卡池边界重置策略 (终末地三池各不同 —— 联网核实 + uigf 数据验证):
+    //   - 特许池(Special): 仅 120 硬保底每期重置 (pity_since_last_up); 80 小保底【继承】(current_pity 不重置)
+    //   - 武器池(Weapon):  40 小保底 + 80 硬保底【都】每期重置 (current_pity 与 pity_since_last_up 都重置, 均不继承)
+    //   - 辉光庆典(Joint): 无硬保底, 连续累加, 不按期重置
+    //   got_up_banner: 本期是否已出过 UP/限定 (硬保底每期仅生效一次), 每期重置
+    //   hardpity_n:    硬保底强制阈值 —— 角色 120 抽; 武器 8 申领(= 第 71..80 抽强制出限定)
+    // 三池均无“歪→下次必中”那种保底; 边界用 poolName 变化探测 (数据里每期 pool_name 唯一;
+    //   武器 id 为负, 桶内按 |id| 升序 = 时间序, 每期连续).
+    bool got_up_banner = false;
+    const bool track_special = (!isWeapon && !isJoint);
+    const bool track_weapon  = isWeapon;
+    const bool track_banner  = (track_special || track_weapon);   // Joint 不按期重置
+    const int  hardpity_n    = isWeapon ? 71 : 120;
 
     // 第30抽赠送十连处理 (依据《明日方舟终末地抽卡机制解析》2.1.1):
     //   - "该十连享有基础概率(0.008),但不占用也不增加保底进度"
@@ -977,6 +958,15 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     const size_t total = bucket.size();
     for (size_t i = 0; i < total; ++i) {
         const bool isFree = bucket.is_free[i];
+
+        // 卡池边界探测: poolName 变化 = 进入新一期卡池.
+        //   特许池: 120 硬保底不继承 → pity_since_last_up + got_up_banner 清零; 80 小保底继承 (current_pity 不动)
+        //   武器池: 40 + 80 都不继承 → current_pity + pity_since_last_up + got_up_banner 全清零
+        if (track_banner && i > 0 && bucket.poolNames[i] != bucket.poolNames[i - 1]) {
+            pity_since_last_up = 0;
+            got_up_banner      = false;
+            if (track_weapon) current_pity = 0;   // 武器 40 小保底也每期重算 (角色 80 小保底继承, 不清)
+        }
 
         // 赠送十连不推进保底通道
         if (!isFree) {
@@ -1018,35 +1008,30 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
             acc.sum_up    += slot_up;
             acc.sum_sq_up += (long long)slot_up * slot_up;
 
-            // win_5050 分子:
-            //   - Special 池:只在 50/50 阶段(!had_non_up)的 UP 才计入,大保底必中 UP 不算
-            //   - 武器池/Joint 池:每个 UP 都独立计入 (无大保底, 每个 6 星都是独立判定)
-            //     - 武器池: 25% 条件率
-            //     - Joint 池: 50% 条件率 (4UP 均匀分布, 2 限定 / 2 常驻)
-            // count_win/sum_win (avg_win "不歪出货期望") 仅对 Special 池有物理含义
-            // (Joint 池没有"小保底", "首次出限定不歪" 不是有意义的事件)
-            if (isWeapon || isJoint) {
+            // 胜负统计 (修正: 终末地无“歪→下次必中”, 每个六星/六星武器都是独立判定):
+            //   - 角色池 50/50, 武器池 25% 条件率 —— 每个 UP/限定都计入“胜”, 唯一例外:
+            //     由【硬保底强制】出的那个 (本期首个 UP/限定, 且当期累计抽数已打满硬保底阈值)
+            //     不是掷硬币结果, 必须剔除, 否则把真实条件率系统性拉高 (角色>50%, 武器>25%)。
+            //     角色 120 抽硬保底; 武器 8 申领(第 71..80 抽)硬保底, 见 hardpity_n。
+            //   - 辉光庆典: 无硬保底, 每个限定直接计入。
+            //   - avg_win (count_win/sum_win) 仅特许池有物理含义; 武器/Joint 不累计 (avg_win 保持 -1)。
+            const bool forced_by_hardpity =
+                track_banner && !got_up_banner && !isFree && pity_since_last_up >= hardpity_n;
+            if (isJoint) {
                 acc.win_5050++;
-            } else if (!had_non_up) {
+            } else if (!forced_by_hardpity) {
                 acc.win_5050++;
-                acc.count_win++;
-                acc.sum_win += slot_all;
+                if (!isWeapon) {            // avg_win 仅对特许池定义
+                    acc.count_win++;
+                    acc.sum_win += slot_all;
+                }
             }
-            had_non_up = false;
-            // 赠送十连出 UP 不重置 pity_since_last_up (独立通道); 正常出 UP 重置
+            got_up_banner = true;
+            // 赠送十连出 UP 不重置 pity_since_last_up (独立通道); 正常出 UP/限定 重置
             if (!isFree) pity_since_last_up = 0;
         } else {
-            // lose_5050 分母:
-            //   - Special 池:上一次 6 星是 UP(had_non_up=false)→ 现在这个是"歪了",首次计入
-            //                  上一次 6 星是非 UP(had_non_up=true)→ 已在大保底阶段,跨期继承
-            //                  此时继续出非 UP 是异常数据(大保底规则本不允许),不重复计数
-            //   - 武器池/Joint 池:每个非 UP 6 星都独立计入 (无大保底, 可以连续出非 UP)
-            if (isWeapon || isJoint) {
-                acc.lose_5050++;
-            } else if (!had_non_up) {
-                acc.lose_5050++;
-            }
-            had_non_up = true;
+            // 非 UP/非限定六星 = 一次独立判定的“负”。终末地可连续歪多次, 全部如实计入。
+            acc.lose_5050++;
         }
         // 赠送十连出货不重置 current_pity (独立通道); 正常出货重置
         if (!isFree) current_pity = 0;
@@ -1411,7 +1396,7 @@ DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
     swprintf(outMsg, 4096,
         L"【角色卡池 (特许寻访)】 总计六星: %d | 出当期 UP: %d%ls\r\n"
         L" ▶ 综合六星 (含歪) 出货平均期望:     %5.2f 抽 (理论 ≈ 51.81)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
-        L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 74.33)   [95%% CI: %5.1f ~ %5.1f]    |   真实不歪率: %5.1f%% (理论 50%%) (%d胜%d负)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
+        L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 79.29)   [95%% CI: %5.1f ~ %5.1f]    |   真实不歪率: %5.1f%% (理论 50%%) (%d胜%d负)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
         L" ▶ 赢下小保底 (不歪) 的出货期望:     %ls\r\n\r\n"
         L"【角色卡池 (辉光庆典)】 总计六星: %d | 出限定 (非常驻): %d%ls\r\n"
         L" ▶ 综合六星 (含常驻) 出货平均期望:   %5.2f 抽 (理论 ≈ 51.81)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
@@ -2378,7 +2363,7 @@ void RebuildChartCache(HWND hwnd) {
         // 综合六星: 机制与 Special 池一致 (0.8% 基础, k=66 软保底, k=80 硬保底,
         //           第 30 抽赠送十连), 直接复用 g_cdf_char。
         // 限定 (非常驻): 与 Special 池 UP 显著不同!
-        //   - Special 池: 50/50 歪率 + 120 抽 UP 硬保底, E[首 UP] ≈ 74.33
+        //   - Special 池: 50/50 歪率 + 120 抽 UP 硬保底, E[首 UP] ≈ 79.29 (原始抽; 净成本 ≈74.33)
         //   - Joint  池: 50/50 但无 UP 大保底 / 无 UP 硬保底 (120 抽是赠送选择券,
         //                与抽卡概率独立), E[首限定] = 2 × 51.81 ≈ 103.62 抽
         //   两者差异: Joint 池长尾远长 — 没有兜底, 极端非酋可能要 200+ 抽。
