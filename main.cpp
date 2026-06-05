@@ -1,5 +1,5 @@
 // ============================================================
-// Endfield Gacha Exporter - UIGF v4.2 / 面向数据 / PMR 栈分配
+// Endfield Gacha Exporter - UIGF v4.2 / 面向数据 / PMR / AoS
 // ============================================================
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +15,8 @@
 #include <charconv>
 #include <ranges>
 #include <memory_resource>
+#include <memory>           // std::make_unique_for_overwrite (C++20): 2MB PMR arena 改在堆上不清零分配
+#include <cstdint>          // uint8_t / SIZE_MAX (此前靠传递包含, 这里显式)
 #include <array>
 #include <numeric>
 #include <unordered_set>
@@ -213,20 +215,24 @@ std::string FetchPath(HINTERNET hConnect, const std::wstring& path) {
               WinHttpReceiveResponse(hRequest, NULL);
 
     if (ok) {
-        char stackBuf[8192];
-        DWORD dwSize = 0, dwDownloaded = 0;
-        while (true) {
-            if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
-            if (dwSize == 0) break;
-            if (dwSize <= sizeof(stackBuf)) {
-                if (!WinHttpReadData(hRequest, stackBuf, dwSize, &dwDownloaded)) break;
-                if (dwDownloaded == 0) break;
-                response.append(stackBuf, dwDownloaded);
-            } else {
-                std::vector<char> heapBuf(dwSize);
-                if (!WinHttpReadData(hRequest, heapBuf.data(), dwSize, &dwDownloaded)) break;
-                if (dwDownloaded == 0) break;
-                response.append(heapBuf.data(), dwDownloaded);
+        // 固定 16KB 复用缓冲: 不再为 >8KB 的区块反复 new/销毁 std::vector<char>。
+        // WinHttpQueryDataAvailable 给出当前可读字节数, 再用固定缓冲分块读完该批。
+        std::array<char, 16384> readBuf;
+        bool reading = true;
+        while (reading) {
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &available) || available == 0) break;
+            while (available > 0) {
+                DWORD bufSz = (DWORD)readBuf.size();
+                DWORD chunk  = (available < bufSz) ? available : bufSz;
+                DWORD downloaded = 0;
+                if (!WinHttpReadData(hRequest, readBuf.data(), chunk, &downloaded) ||
+                    downloaded == 0) {
+                    reading = false;   // 读失败或读到 0: 彻底结束 (与原版 break 整个循环一致)
+                    break;
+                }
+                response.append(readBuf.data(), downloaded);
+                available -= downloaded;
             }
         }
     }
@@ -237,12 +243,13 @@ std::string FetchPath(HINTERNET hConnect, const std::wstring& path) {
 struct PoolConfig { std::string poolType, displayName; bool isWeapon; };
 
 // ---------------------------------------------------------
-// [BufferedWriter - 析构 RAII Flush]
+// [BufferedWriter - 析构 RAII Flush + 短写/失败检查]
 // ---------------------------------------------------------
 struct BufferedWriter {
     HANDLE hFile;
     char buf[65536];
     DWORD pos = 0;
+    bool ok = true;   // 一旦写失败置 false: 后续 Flush/Write 短路, 调用方据此决定是否提交结果
 
     explicit BufferedWriter(HANDLE h) : hFile(h) {}
     ~BufferedWriter() { Flush(); }
@@ -250,28 +257,41 @@ struct BufferedWriter {
     BufferedWriter(const BufferedWriter&) = delete;
     BufferedWriter& operator=(const BufferedWriter&) = delete;
 
-    void Flush() {
-        if (pos > 0 && hFile != INVALID_HANDLE_VALUE) {
-            DWORD written;
-            WriteFile(hFile, buf, pos, &written, NULL);
-            pos = 0;
+    // 循环写完整块, 处理短写 (written < pos) 与写失败。任一失败置 ok=false 并停止;
+    // 已失败后再调用直接短路, 不向坏句柄重复写 (也避免 pos 不清零导致 Write 死循环)。
+    bool Flush() {
+        if (!ok) return false;
+        if (hFile == INVALID_HANDLE_VALUE) { ok = false; return false; }
+        DWORD offset = 0;
+        while (offset < pos) {
+            DWORD written = 0;
+            if (!WriteFile(hFile, buf + offset, pos - offset, &written, nullptr) ||
+                written == 0) {
+                ok = false;
+                return false;
+            }
+            offset += written;
         }
+        pos = 0;
+        return true;
     }
     void Write(const char* data, DWORD len) {
+        if (!ok) return;
         while (len > 0) {
             DWORD space = sizeof(buf) - pos;
             DWORD chunk = (len < space) ? len : space;
             std::memcpy(buf + pos, data, chunk);
             pos += chunk; data += chunk; len -= chunk;
-            if (pos == sizeof(buf)) Flush();
+            if (pos == sizeof(buf) && !Flush()) return;
         }
     }
     void Write(std::string_view sv) { Write(sv.data(), (DWORD)sv.size()); }
 
     template<size_t N>
     void WriteLit(const char (&s)[N]) {
+        if (!ok) return;
         constexpr DWORD len = N - 1;
-        if (pos + len > sizeof(buf)) Flush();
+        if (pos + len > sizeof(buf) && !Flush()) return;
         std::memcpy(buf + pos, s, len);
         pos += len;
     }
@@ -355,9 +375,21 @@ int main() {
         {"",                                   "武器 - 全历史记录", true}
     };
 
-    // PMR:栈上 2MB 池
-    std::array<std::byte, 2 * 1024 * 1024> stackBuffer;
-    std::pmr::monotonic_buffer_resource pool(stackBuffer.data(), stackBuffer.size());
+    // PMR:2MB 单调缓冲池, 现放在【堆】上 (与 gui.cpp 的 stack→heap 修复同步, 此前在栈上)。
+    //   - make_unique_for_overwrite 不主动清零整个 arena (区别于 std::vector(2MB) / 带括号的
+    //     new[]() / calloc 那种值初始化), 可避免无意义地写满 2MB。实际页面提交、物理驻留与
+    //     page fault 数仍取决于 Windows 堆分配器、页面复用情况与运行时访问模式 —— 别写死成
+    //     "只有写入部分才落物理页"。
+    //   - 移到堆后 main 线程不再需要大栈: 构建时的 /STACK:4194304 可去掉, 回默认栈即可
+    //     (本程序除这块外最大的栈对象是 BufferedWriter 的 64KB, 默认 1MB 栈绰绰有余)。
+    //   - 没显式指定 upstream → 默认 get_default_resource(): 记录数远超 reserve(10000) 把 2MB
+    //     用尽时会 fallback 到堆而非崩溃 (有意为之)。monotonic_buffer_resource 不回收扩容前的
+    //     旧块, 直到整个 pool 析构。
+    // 生命周期: arena → pool → alloc 顺序声明, 析构逆序 (各 pmr 容器更早析构), pool 引用的
+    //   arena 内存在 pool 存活期间始终有效。
+    constexpr size_t kArenaSize = 2 * 1024 * 1024;
+    auto arena = std::make_unique_for_overwrite<std::byte[]>(kArenaSize);  // 堆, 不清零 (C++20)
+    std::pmr::monotonic_buffer_resource pool(arena.get(), kArenaSize);
     std::pmr::polymorphic_allocator<std::byte> alloc(&pool);
 
     // AoS 记录
@@ -379,8 +411,15 @@ int main() {
                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile.h != INVALID_HANDLE_VALUE) {
-            DWORD fileSize = GetFileSize(hFile, NULL);
-            if (fileSize != INVALID_FILE_SIZE && fileSize > 0) {
+            // 与 gui.cpp 同步: GetFileSize (32 位, 截断 >4GB) → GetFileSizeEx (64 位) + size_t
+            // 上界校验。本地 uigf 文件正常远小于 4GB, 但用 64 位读 + 显式校验更稳健
+            // (尤其 32 位构建下 size_t 仅 4GB)。
+            LARGE_INTEGER fileSize64{};
+            if (GetFileSizeEx(hFile, &fileSize64) &&
+                fileSize64.QuadPart > 0 &&
+                static_cast<unsigned long long>(fileSize64.QuadPart) <=
+                    static_cast<unsigned long long>(SIZE_MAX)) {
+                size_t fileSize = static_cast<size_t>(fileSize64.QuadPart);
                 MappingHandle hMap;
                 hMap.h = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
                 if (hMap.h) {
@@ -589,7 +628,11 @@ int main() {
     //   1. 先分区:角色(id 正) 在前,武器(id 负) 在后
     //   2. 再按时间升序
     //   3. 再按 |id| 升序(同一秒内的多抽)
-    auto abs_ll = [](long long v) { return v < 0 ? -v : v; };
+    // 与 gui.cpp 同步: 防 LLONG_MIN 取负的有符号溢出 (UB) —— 用无符号求绝对值, 排序语义不变。
+    auto abs_ll = [](long long v) -> unsigned long long {
+        return v < 0 ? (0ULL - static_cast<unsigned long long>(v))
+                     : static_cast<unsigned long long>(v);
+    };
     std::ranges::sort(records, [&](const ExportRecord& a, const ExportRecord& b) {
         bool isWepA = a.safe_id < 0;
         bool isWepB = b.safe_id < 0;
@@ -607,6 +650,7 @@ int main() {
                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 
     if (hOut != INVALID_HANDLE_VALUE) {
+        bool writeOk = false;   // 写出是否全部成功; 失败则不替换原文件 (避免用半截 tmp 覆盖好文件)
         {
             BufferedWriter w(hOut);
             char numBuf[32];
@@ -706,12 +750,17 @@ int main() {
             }
 
             w.WriteLit("            ]\n        }\n    ]\n}\n");
-            // BufferedWriter 析构自动 Flush
+            w.Flush();              // 显式收尾 flush 并捕获结果 (析构里那次因 pos==0 成 no-op)
+            writeOk = w.ok;
         }
         CloseHandle(hOut);
 
-        if (MoveFileExA(tempFilename.c_str(), uigfFilename.c_str(),
-                        MOVEFILE_REPLACE_EXISTING)) {
+        if (!writeOk) {
+            // 写入中途失败 (磁盘满 / IO 错误): 绝不能用半截 tmp 覆盖好的原文件 —— 删掉 tmp, 保留原文件。
+            DeleteFileA(tempFilename.c_str());
+            printf("写入失败 (磁盘空间不足或 IO 错误)!已保留原记录文件,未做替换。\n");
+        } else if (MoveFileExA(tempFilename.c_str(), uigfFilename.c_str(),
+                               MOVEFILE_REPLACE_EXISTING)) {
             printf("已成功更新记录并保存至: %s\n", uigfFilename.c_str());
         } else {
             printf("文件覆盖失败!请手动将 %s 重命名为 %s\n",
