@@ -21,6 +21,8 @@
 #include <memory_resource>
 #include <array>
 #include <cstdint>
+#include <memory>      // std::make_unique_for_overwrite (C++20) —— worker 的 2MB PMR arena 用它在堆上不清零分配
+#include <process.h>   // _beginthreadex / _endthreadex(调用 CRT 的线程应走这个而非裸 CreateThread)
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -284,33 +286,49 @@ std::unordered_map<std::string, std::string, StringHash, std::equal_to<>> ParseP
 
 // ---------------------------------------------------------
 // [SoA 分桶 - 角色/武器 独立桶,Calculate 不再 filter 全量]
-// 热路径只访问 4 个字段:rank_types / names / poolNames / is_free
+// 统计热路径 (非六星的 [[likely]] 分支) 只访问紧凑的标量数组:
+//   rank_types / is_free / starts_new_banner —— 全是枚举/单字节, 顺序扫描, 缓存友好。
+// names / poolNames 仅在少量六星记录做 UP 判定/映射查找时才访问 (会触达 mmap 字节)。
 // is_free: 标记"第30抽赠送十连"的成员,该机制不占用也不增加保底进度
-// (依据《明日方舟终末地抽卡机制解析》2.1.1)
+//   (依据《明日方舟终末地抽卡机制解析》2.1.1)
+// starts_new_banner (v0.1.3.2): 分桶阶段预计算的"本条是否为新一期卡池起点"字节标记。
+//   取代 Calculate 里每条记录对 poolNames[i] vs poolNames[i-1] 的 string_view 比较 ——
+//   那个比较即便对非六星也要跑, 且 operator!= 在等长时要 memcmp mmap 里的池名字节,
+//   削弱 SoA 收益。预计算后热路径只读一个字节; 池名仅留给六星 UP 查找。
 // ---------------------------------------------------------
 struct PullBucket {
     std::pmr::vector<RankType>         rank_types;
     std::pmr::vector<std::string_view> names;
     std::pmr::vector<std::string_view> poolNames;
     std::pmr::vector<uint8_t>          is_free;
+    std::pmr::vector<uint8_t>          starts_new_banner;  // v0.1.3.2: 1 = 本条 poolName 与上一条不同
 
     explicit PullBucket(std::pmr::polymorphic_allocator<std::byte> alloc)
-        : rank_types(alloc), names(alloc), poolNames(alloc), is_free(alloc) {}
+        : rank_types(alloc), names(alloc), poolNames(alloc),
+          is_free(alloc), starts_new_banner(alloc) {}
 
     void reserve(size_t cap) {
         rank_types.reserve(cap); names.reserve(cap);
         poolNames.reserve(cap);  is_free.reserve(cap);
+        starts_new_banner.reserve(cap);
     }
     void push_back(RankType rt, std::string_view name, std::string_view pool, uint8_t free_flag) {
+        // 与上一条 (同桶内) 比较池名, 把"是否新卡池起点"在分桶时算好。首条 (桶为空) 记 0 ——
+        // 等价于 Calculate 原来的 i>0 守卫。此处比较的是刚解析、仍在缓存里的 mmap 字节,
+        // 比挪到统计热路径里逐条比更划算 (统计循环每条都要跑、且会污染 SoA 的顺序访问)。
+        uint8_t starts_new = (!poolNames.empty() && poolNames.back() != pool) ? 1 : 0;
         rank_types.push_back(rt); names.push_back(name);
         poolNames.push_back(pool); is_free.push_back(free_flag);
+        starts_new_banner.push_back(starts_new);
     }
     size_t size() const { return rank_types.size(); }
 };
 
-// alignas(128) 而非 64: Apple Silicon 与 Intel Sandy Bridge+ 上 spatial prefetcher
-// 会预取相邻 cacheline (128B), 用 128 对齐避免 false sharing 更稳妥
-struct alignas(128) StatsAccumulator {
+// StatsAccumulator: Calculate() 内的单线程累加器 (局部变量 acc), 不存在多核并发写,
+// 不需要 cache-line 对齐 —— 故不加 alignas (旧版的 alignas(128) 在单线程下是无操作,
+// 留着只会误导维护者以为这里有并发)。将来若改成多线程分片归约、每线程持有相邻
+// accumulator, 再按实际 cache-line 布局补 padding 防 false sharing 即可。
+struct StatsAccumulator {
     std::array<int, 260> freq_all{};
     std::array<int, 260> freq_up{};
     long long sum_all = 0, sum_sq_all = 0, sum_up = 0, sum_sq_up = 0, sum_win = 0;
@@ -959,10 +977,11 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     for (size_t i = 0; i < total; ++i) {
         const bool isFree = bucket.is_free[i];
 
-        // 卡池边界探测: poolName 变化 = 进入新一期卡池.
+        // 卡池边界探测: 读分桶阶段预计算的字节标记 (v0.1.3.2), 不再在热路径 memcmp 池名。
+        //   starts_new_banner[i] = (本条 poolName 与上一条不同); 首条恒为 0 → 已含原 i>0 守卫。
         //   特许池: 120 硬保底不继承 → pity_since_last_up + got_up_banner 清零; 80 小保底继承 (current_pity 不动)
         //   武器池: 40 + 80 都不继承 → current_pity + pity_since_last_up + got_up_banner 全清零
-        if (track_banner && i > 0 && bucket.poolNames[i] != bucket.poolNames[i - 1]) {
+        if (track_banner && bucket.starts_new_banner[i]) {
             pity_since_last_up = 0;
             got_up_banner      = false;
             if (track_weapon) current_pity = 0;   // 武器 40 小保底也每期重算 (角色 80 小保底继承, 不清)
@@ -1207,7 +1226,7 @@ struct ProcessOutput {
     HANDLE      hFile = INVALID_HANDLE_VALUE;
     HANDLE      hMap  = NULL;
     const void* viewPtr = nullptr;
-    DWORD       fileSize = 0;
+    size_t      fileSize = 0;   // v0.1.3.2: DWORD → size_t, 配合 GetFileSizeEx (不再 32 位截断)
 
     std::string utf8_chars;     // 来自 hCharEdit (这个无法 mmap,GUI 控件文本必须主线程 GetWindowText)
     std::string utf8_poolMap;
@@ -1232,8 +1251,12 @@ struct ProcessOutput {
 // 用全局原子防双开;Win32 上 LONG volatile + InterlockedExchange 等价于 atomic_flag
 static volatile LONG g_processing = 0;
 
-// Worker 线程入口:纯 CPU 工作,不碰任何 GUI
-DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
+// Worker 线程入口:纯 CPU 工作,不碰任何 GUI。
+// 用 _beginthreadex 启动 (见 ProcessFile_Submit), 故签名是 unsigned __stdcall(void*) ——
+// 这样 worker 里用到的 CRT (std::string/unordered_map/swprintf/std::ranges::sort/异常等)
+// 的 per-thread 状态能被正确初始化与清理; 裸 CreateThread 跑 CRT 在极端低内存下有终止
+// 进程的风险 (见 ProcessFile_Submit 的说明)。
+unsigned __stdcall ProcessFile_Worker(void* arg) {
     auto* out = (ProcessOutput*)arg;
 
     // 解析输入(WideToUtf8 已经在主线程做完,这里直接用 utf8 视图)
@@ -1249,14 +1272,31 @@ DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
         bufferView.remove_prefix(3);
     }
 
-    // PMR:栈上 2MB 内存池(对应主线程版本的设计)。
-    // worker 线程在 ProcessFile_Submit 中以 4MB 栈创建,容得下这 2MB 缓冲区。
-    // 栈池 vs 堆池的性能差异:
-    //   - 分配/释放开销 0 (栈指针偏移 vs malloc 一次 2MB)
-    //   - 与 worker 栈的局部变量物理相邻,L1/L2 热,TLB 不会 miss
-    //   - 整个 PMR 工作集(temps + bucketChar + bucketWep) 都从此池分配,锁在热区
-    std::array<std::byte, 2 * 1024 * 1024> stackBuffer;
-    std::pmr::monotonic_buffer_resource pool(stackBuffer.data(), stackBuffer.size());
+    // PMR:2MB 单调缓冲池 (monotonic_buffer_resource)。v0.1.3.2 起【改放堆上】(此前在栈上)。
+    //
+    // 为什么从栈改到堆 (用 make_unique_for_overwrite, 而不是 std::vector<std::byte>(2MB)):
+    //   - 修正 v0.1.3.1 的一处错误结论: 当时注释说"栈版只有真正写入的 ~600KB 才落到物理页",
+    //     这不对。固定 2MB 栈帧 >= 1 页时 MSVC 序言会调 __chkstk 逐页探测【整块 2MB】以保证栈
+    //     能安全扩展 —— 进入 worker 时这 2MB 就被全部触达/提交, 与 PMR 实际用多少无关。
+    //   - 反而堆写法更省: make_unique_for_overwrite 不清零 (区别于 std::vector(2MB) / 带括号的
+    //     new[]() / calloc 那种值初始化), 内存按需触页 —— 只有 PMR 真正写到的 ~600KB 才 fault-in
+    //     成物理页, 不像栈版被 __chkstk 强行摸满 2MB。
+    //   - 顺带: 不再需要给 worker 配 4MB 栈 (见 ProcessFile_Submit), 线程栈回默认即可,
+    //     去掉了那处 STACK_SIZE_PARAM_IS_A_RESERVATION 特殊化。
+    //   - (先前感到"堆版更卡"是因为当时用了会清零的写法; 本写法无清零, 不复现该开销。)
+    // 关于缓存: 别再写"L1/L2 热 / TLB 不 miss"。2MB = 512 页, 远超 L1(~48KB) 和 L1 DTLB(~64 项);
+    //   能保证的只是减少分配器调用 + 让 temps/bucket 集中在一段连续内存 (利于顺序访问的局部性)。
+    //   真实命中率要用 PMU 实测。
+    // 关于 fallback: pool 没显式指定 upstream, 默认 = get_default_resource() (= new_delete_resource)。
+    //   故【不是】严格只用这 2MB: 超大导入耗尽后会 fallback 到堆而非崩溃 (有意为之, 比抛 bad_alloc
+    //   退出更实用)。另注 monotonic_buffer_resource 不回收 vector 扩容前的旧块, 直到整个 pool 析构
+    //   —— 一旦 reserve() 预估被大幅突破, arena 占用会比普通 allocator 涨得快。
+    //
+    // 生命周期: 声明顺序 arena → pool → alloc, 析构逆序 (alloc/pool 先, arena 后), 故 pool 引用
+    //   的 arena 内存在 pool 存活期间始终有效; 各 pmr 容器声明在 alloc 之后, 会更早析构。
+    constexpr size_t kArenaSize = 2 * 1024 * 1024;
+    auto arena = std::make_unique_for_overwrite<std::byte[]>(kArenaSize);  // 堆, 不清零 (C++20)
+    std::pmr::monotonic_buffer_resource pool(arena.get(), kArenaSize);
     std::pmr::polymorphic_allocator<std::byte> alloc(&pool);
 
     struct Temp {
@@ -1315,11 +1355,22 @@ DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
     if (temps.empty()) {
         out->ok = false;
         out->errMsg = L"JSON 解析失败或无数据。";
-        PostMessageW(out->hwnd_main, WM_APP_PROCESS_DONE, 0, (LPARAM)out);
+        // 若主窗口已销毁 (用户在 worker 跑完前关窗), PostMessageW 会失败 (HWND 失效),
+        // 没人会消费 out → worker 自己负责清理, 否则泄漏 ProcessOutput + mmap 句柄, 且
+        // g_processing 卡在 1。out 在 Submit 里已 release 给 worker, 此处归 worker 所有。
+        if (!PostMessageW(out->hwnd_main, WM_APP_PROCESS_DONE, 0, (LPARAM)out)) {
+            delete out;
+            InterlockedExchange(&g_processing, 0);
+        }
         return 0;
     }
 
-    auto abs_ll = [](long long v) { return v < 0 ? -v : v; };
+    // 防御 LLONG_MIN: 对 v == LLONG_MIN 取 -v 是有符号溢出 (UB)。正常抽卡 id 不会是
+    // LLONG_MIN, 但 id 来自外部文件, 用无符号求绝对值规避 UB (升序排序语义不变)。
+    auto abs_ll = [](long long v) -> unsigned long long {
+        return v < 0 ? (0ULL - static_cast<unsigned long long>(v))
+                     : static_cast<unsigned long long>(v);
+    };
     auto less = [&](const Temp& a, const Temp& b) {
         bool wepA = a.id < 0;
         bool wepB = b.id < 0;
@@ -1436,7 +1487,13 @@ DWORD WINAPI ProcessFile_Worker(LPVOID arg) {
     out->outMsg = outMsg;
     out->ok = true;
 
-    PostMessageW(out->hwnd_main, WM_APP_PROCESS_DONE, 0, (LPARAM)out);
+    // 同上: 关窗后 HWND 失效会让 PostMessageW 失败, worker 自行清理避免泄漏。
+    // (残留的窄窗口: HWND 仍有效、消息已入队但消息循环恰好已退出 —— 那种情况下泄漏发生在
+    //  进程退出的一瞬, 由 OS 在 ExitProcess 统一回收, 无实际危害, 故不再额外加线程 join。)
+    if (!PostMessageW(out->hwnd_main, WM_APP_PROCESS_DONE, 0, (LPARAM)out)) {
+        delete out;
+        InterlockedExchange(&g_processing, 0);
+    }
     return 0;
 }
 
@@ -1466,11 +1523,17 @@ bool ProcessFile_Submit(HWND hwnd, const std::wstring& path) {
         InterlockedExchange(&g_processing, 0);
         return false;
     }
-    out->fileSize = GetFileSize(out->hFile, NULL);
-    if (out->fileSize == 0 || out->fileSize == INVALID_FILE_SIZE) {
+    // v0.1.3.2: GetFileSize (32 位, 截断 >4GB) → GetFileSizeEx (64 位)。抽卡文件正常远小于 4GB,
+    // 但输入来自外部文件, 用 64 位读 + 显式上界校验更稳健 (尤其 32 位构建下 size_t 仅 4GB)。
+    LARGE_INTEGER fileSize64{};
+    if (!GetFileSizeEx(out->hFile, &fileSize64) ||
+        fileSize64.QuadPart <= 0 ||
+        static_cast<unsigned long long>(fileSize64.QuadPart) >
+            static_cast<unsigned long long>(SIZE_MAX)) {
         InterlockedExchange(&g_processing, 0);
         return false;
     }
+    out->fileSize = static_cast<size_t>(fileSize64.QuadPart);
     out->hMap = CreateFileMappingW(out->hFile, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!out->hMap) {
         InterlockedExchange(&g_processing, 0);
@@ -1482,17 +1545,22 @@ bool ProcessFile_Submit(HWND hwnd, const std::wstring& path) {
         return false;
     }
 
-    // 启动 worker. 显式指定 4MB 栈(与主线程 /STACK:4194304 对齐;
-    // CreateThread 默认栈只 1MB,容纳不下 worker 内部的 2MB PMR 栈池)。
-    // 注意:dwStackSize 是预留+commit,Windows 实际只 commit 必要页,常驻内存仅约 1 页。
-    HANDLE hThread = CreateThread(NULL, 4 * 1024 * 1024,
-                                  ProcessFile_Worker, out.get(), 0, NULL);
-    if (!hThread) {
+    // 启动 worker。v0.1.3.2: 2MB PMR arena 已挪到堆 (见 ProcessFile_Worker), worker 栈需求很小,
+    // 故 stack_size 传 0 (用 EXE 默认栈大小), 不再需要 4MB + STACK_SIZE_PARAM_IS_A_RESERVATION。
+    //
+    // 仍用 _beginthreadex 而非裸 CreateThread: worker 大量使用 CRT (std::string / unordered_map /
+    // swprintf / std::ranges::sort / 异常), 应走 CRT 线程入口以正确初始化/清理 per-thread 状态;
+    // 裸 CreateThread 跑 CRT 在极端低内存下有终止进程的风险。返回的句柄需 CloseHandle。
+    uintptr_t raw = _beginthreadex(nullptr, 0,
+                                   ProcessFile_Worker, out.get(),
+                                   0, nullptr);
+    if (raw == 0) {
         InterlockedExchange(&g_processing, 0);
         return false;
     }
-    CloseHandle(hThread);  // 我们用 PostMessage 同步,不需要 join
-    out.release();         // worker 接管所有权,完成时主线程在 WM_APP_PROCESS_DONE 里 delete
+    HANDLE hThread = reinterpret_cast<HANDLE>(raw);
+    CloseHandle(hThread);  // 用 PostMessage 同步, 不 join; _beginthreadex 的句柄仍需 CloseHandle
+    out.release();         // worker 接管所有权, 完成时主线程在 WM_APP_PROCESS_DONE 里 delete
     return true;
 }
 
@@ -1515,7 +1583,7 @@ void ProcessFile_Consume(HWND hwnd, ProcessOutput* out) {
 }
 
 // -------------------------------------------------------
-// 图形渲染 —— drawCurve 用栈数组,无堆分配
+// 图形渲染 —— 曲线坐标点用栈数组, 避免在绘图热路径里反复 new 小对象。
 // -------------------------------------------------------
 // ---------------------------------------------------------
 // [ECDF (经验累积分布函数) 图]
