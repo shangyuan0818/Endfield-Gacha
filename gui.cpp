@@ -2512,8 +2512,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         HWND hL_Wep = CreateWindowW(L"STATIC", L"常驻六星武器:",
             WS_CHILD | WS_VISIBLE,
             DPIScale(20), DPIScale(105), DPIScale(95), DPIScale(20), hwnd, NULL, NULL, NULL);
+        // 限定武器: 熔铸火焰、艺术暴君、使命必达、落草、狼之绯、孤舟、镀红祝福
         hWepEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W",
-            L"宏愿,不知归,黯色火炬,扶摇,热熔切割器,显赫声名,白夜新星,大雷斑,赫拉芬格,典范,昔日精品,破碎君王,J.E.T.,骁勇,负山,同类相食,楔子,领航者,骑士精神,遗忘,爆破单元,作品：蚀迹,沧溟星梦,光荣记忆,望乡",
+            L"宏愿,不知归,黯色火炬,扶摇,热熔切割器,显赫声名,白夜新星,大雷斑,赫拉芬格,典范,昔日精品,破碎君王,J.E.T.,骁勇,负山,同类相食,楔子,领航者,骑士精神,遗忘,爆破单元,作品：蚀迹,沧溟星梦,光荣记忆,望乡,雾中微光,灯火使命,赤缨,幻想苦痛",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             DPIScale(120), DPIScale(100), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
 
