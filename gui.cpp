@@ -387,7 +387,11 @@ float DPIScaleF(float value) { return value * (g_dpi / 96.0f); }
 //     80 抽 UP  保底:连续 7 次十连(70 抽)无 UP,第 8 次十连必含至少 1 个 UP
 //   理论验证:
 //     E[首 6 星] ≈ 19.17 抽(由下方解析 CDF 推出)
-//     E[首 UP]  ≈ 81.66 抽(Reddit 四态递推)
+//     E[首 UP]  ≈ 54.74 抽(Reddit 四态递推 + 80 抽硬保底截断, 即 g_cdf_wep_up 模型
+//                  均值 54.737。Reddit 原文 81.66 是"忽略 80 保底"的无截断值 ——
+//                  经验均值必然 <=80, 应与含保底的 54.74 对照, 不应再拿 81.66 当参考。
+//                  另: 经验 pity_up 记申领内单抽落点, 实测常比按申领末记账的 54.74
+//                  再低 3~7 抽 (保底/强制出货的拨内落点游戏未公开)。)
 //
 // KS 理论 CDF 构造 — "距离上次 6 星的抽数 x"的分布:
 //   角色池 g_cdf_char[x=0..80]:hazard 段函数积分
@@ -410,7 +414,10 @@ float DPIScaleF(float value) { return value * (g_dpi / 96.0f); }
 //     (3) 没有 120 抽 UP 硬保底——120/240 抽是赠送选择券(用户主动选, 与抽卡概率独立)
 //   等价模型: 重复独立的"出 6 星"周期, 每周期 50% 概率出限定 (即停止). 周期内"距上次六星
 //   x 抽"的分布 = g_cdf_char 描述的同一分布 (含 30 抽赠送十连和 80 抽硬保底).
-//   完整理论期望: E[首限定] ≈ 104.68 抽 (单纯几何停止公式: E[首6星] / 0.5 = 51.81/0.5).
+//   完整理论期望: E[首限定] ≈ 104.68 抽 (由下方前向迭代真实算出)。
+//   注意: 几何停止捷径 E[首6星]/0.5 = 51.81/0.5 = 103.62 并【不】成立 —— 30 抽赠送
+//   十连绑定在"绝对第 30 抽"且每期一次, 不随六星周期重复; 歪后重开的周期均值是
+//   53.90 (无赠送), 真值介于 103.62 与 2×53.90=107.80 之间, 迭代给出 104.68。
 //
 //   实现策略 (CDF 截断 + 解析长尾延伸):
 //     - g_cdf_joint_up[242] 仅覆盖 X=0..240 (与图表 X 轴一致, CDF 在此处 ≈ 0.93).
@@ -1131,8 +1138,30 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         if (isWeapon)      { cdf_up_tbl = g_cdf_wep_up;   cdf_up_len = 81;  }
         else if (isJoint)  { cdf_up_tbl = g_cdf_joint_up; cdf_up_len = 242; }
         else               { cdf_up_tbl = g_cdf_char_up;  cdf_up_len = 122; }
-        s.ks_d_up = ComputeKS(acc.freq_up, acc.max_pity_up, acc.count_up,
-                              cdf_up_tbl, cdf_up_len);
+        if (isWeapon) {
+            // v0.1.3.3 武器 UP K-S: 先把经验 freq_up 按申领 (10 抽) 粒度向上聚合再比较。
+            // 原因: g_cdf_wep_up 的质量只在 10 倍数边界记账 (申领内平坦, 机制如此),
+            // 而经验 pity_up 记录的是申领内具体单抽落点 (自然出货 ~截断几何分布,
+            // 40/80 保底强制出货的拨内落点游戏未公开)。两条阶梯粒度不同, 逐抽比较会被
+            // "拨内错位"系统性抬高 D (落点均匀假设下渐近 ~0.37, 12 期样本伪拒绝率 ~63%)。
+            // 聚合到申领边界后, 任何拨内落点都映射到同一申领, K-S 对落点假设免疫,
+            // 伪拒绝率回到 <= 名义 5% (模拟: ~2%)。
+            // 仅 K-S 内部用聚合副本; ECDF/MRL 图与 avg_up 仍为单抽粒度, 曲线连贯不变。
+            std::array<int, 260> freq_up_claim{};
+            for (int x = 1; x <= acc.max_pity_up; ++x) {
+                if (acc.freq_up[x] == 0) continue;
+                int slot = ((x + 9) / 10) * 10;   // 向上取整到申领末抽
+                if (slot > 259) slot = 259;       // 防御 (正常数据 pity_up <= 80)
+                freq_up_claim[slot] += acc.freq_up[x];
+            }
+            int max_claim = ((acc.max_pity_up + 9) / 10) * 10;
+            if (max_claim > 259) max_claim = 259;
+            s.ks_d_up = ComputeKS(freq_up_claim, max_claim, acc.count_up,
+                                  cdf_up_tbl, cdf_up_len);
+        } else {
+            s.ks_d_up = ComputeKS(acc.freq_up, acc.max_pity_up, acc.count_up,
+                                  cdf_up_tbl, cdf_up_len);
+        }
         s.ks_is_normal_up = (s.ks_d_up <= (1.36 / std::sqrt((double)acc.count_up)));
     }
 
@@ -1451,10 +1480,10 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
         L" ▶ 赢下小保底 (不歪) 的出货期望:     %ls\r\n\r\n"
         L"【角色卡池 (辉光庆典)】 总计六星: %d | 出限定 (非常驻): %d%ls\r\n"
         L" ▶ 综合六星 (含常驻) 出货平均期望:   %5.2f 抽 (理论 ≈ 51.81)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
-        L" ▶ 抽到任一限定 (非常驻) 的平均期望: %5.2f 抽 (理论 ≈ 103.62)  [95%% CI: %5.1f ~ %5.1f]    |   非常驻六星率: %5.1f%% (理论 50%%) (%d限定%d常驻)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n\r\n"
+        L" ▶ 抽到任一限定 (非常驻) 的平均期望: %5.2f 抽 (理论 ≈ 104.68)  [95%% CI: %5.1f ~ %5.1f]    |   非常驻六星率: %5.1f%% (理论 50%%) (%d限定%d常驻)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n\r\n"
         L"【武器卡池 (武库申领)】 总计六星: %d | 出当期 UP: %d%ls\r\n"
         L" ▶ 综合六星出货平均期望:             %5.2f 抽 (理论 ≈ 19.17)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
-        L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 81.66)   [95%% CI: %5.1f ~ %5.1f]    |   6 星中 UP 率: %5.1f%% (理论 25%%) (%d UP / %d 非UP)\t[K-S 检验偏离度 D值: %.3f (%ls)]",
+        L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 54.74)   [95%% CI: %5.1f ~ %5.1f]    |   6 星中 UP 率: %5.1f%% (理论 25%%) (%d UP / %d 非UP)\t[K-S 检验偏离度 D值: %.3f (%ls)]",
         out->statsChar.count_all, out->statsChar.count_up, pendCharStr,
         out->statsChar.avg_all, (std::max)(1.0, out->statsChar.avg_all - out->statsChar.ci_all_err),
         out->statsChar.avg_all + out->statsChar.ci_all_err, out->statsChar.cv_all * 100.0,
@@ -1628,6 +1657,11 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     // 一句话占满图框, 新池子用户体验差 (查不到任何信息).
     // 跳过的只是: 经验 ECDF 阶梯线 (drawEmpiricalECDF)、KS 偏离度标记。
     max_x = ((max_x / 10) + 1) * 10;
+    // v0.1.3.3: 钳到 freq 数组合法上界 259 (容量 260, Calculate 守 slot<260)。
+    // 事件落在 250..259 时上一行取整会把 max_x 推到 260, 下游 freq[k] (k<=max_x)
+    // 越界读。辉光池限定间隔无硬保底, >=250 的间隔真实存在, 非纯理论场景。
+    // (macOS/iOS 移植版两处早已带此钳制, 本次回移; MRL 同款见 DrawMRL。)
+    if (max_x > 259) max_x = 259;
 
     // 网格 + 坐标轴
     Gdiplus::Pen gridPen(Gdiplus::Color(255, 230, 230, 230), DPIScaleF(1.0f));
@@ -2024,6 +2058,10 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     // 经验 MRL 自然为空 (computeEmpiricalMRL 内部已防御 total==0), KS / "你在这里" 标记
     // 也都依赖出金数据, 缺失时跳过。提示在最后叠加灰色字。
     max_x = ((max_x / 10) + 1) * 10;
+    // v0.1.3.3: 同 DrawECDF 的 259 钳制 —— 此处更严重: computeEmpiricalMRL 内
+    // surv[t]/mrl[t] 在 t=260 是【栈数组越界写】(ASan 实测 stack-buffer-overflow),
+    // 末尾 max_y 循环与 mrl_*[t] 读同样越界。触发条件: 任一 freq 事件落在 [250,259]。
+    if (max_x > 259) max_x = 259;
 
     // ---- 计算经验 MRL 序列 (并记录每个 t 处的 surviving 计数) ----
     auto computeEmpiricalMRL = [&](const std::array<int, 260>& freq, int total)
@@ -2433,7 +2471,8 @@ void RebuildChartCache(HWND hwnd) {
         // 限定 (非常驻): 与 Special 池 UP 显著不同!
         //   - Special 池: 50/50 歪率 + 120 抽 UP 硬保底, E[首 UP] ≈ 79.29 (原始抽; 净成本 ≈74.33)
         //   - Joint  池: 50/50 但无 UP 大保底 / 无 UP 硬保底 (120 抽是赠送选择券,
-        //                与抽卡概率独立), E[首限定] = 2 × 51.81 ≈ 103.62 抽
+        //                与抽卡概率独立), E[首限定] ≈ 104.68 抽 (前向迭代;
+        //                几何捷径 2×51.81=103.62 不成立, 见 InitCDFTables 注释)
         //   两者差异: Joint 池长尾远长 — 没有兜底, 极端非酋可能要 200+ 抽。
         //   理论 CDF 单独建表 g_cdf_joint_up (真实前向迭代, n=30 展开 11 次判定, 见 InitCDFTables)。
         // X 轴上限设 240 (= 3 × 80), 覆盖 CDF ~93.5%, 视觉上足以体现长尾形态。
