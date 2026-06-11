@@ -1218,8 +1218,14 @@ struct ViewGuard {
 inline std::wstring GetDynamicWindowText(HWND hwnd) {
     int len = GetWindowTextLengthW(hwnd);
     if (len <= 0) return L"";
-    std::wstring buf((size_t)len, L'\0');
-    GetWindowTextW(hwnd, buf.data(), len + 1);  // GetWindowTextW 需要 len+1 容纳末尾 '\0'
+    // v0.1.3.3: GetWindowTextLengthW 对 RichEdit 文档明示"可能大于实际长度"(估计值)。
+    // 旧写法忽略 GetWindowTextW 的实际拷贝数, 高估时 wstring 尾部残留 L'\0' 填充;
+    // 这些 NUL 经 WideToUtf8 原样转换, 粘在名单最后一个 token 上 (TrimUtf8 只剥空白
+    // 不剥 '\0'), 导致最后一个常驻名 / 最后一条 UP 映射永远匹配不上 JSON 里的名字,
+    // 统计被静默污染。修复: 按实际拷贝数 resize。
+    std::wstring buf((size_t)len + 1, L'\0');
+    int copied = GetWindowTextW(hwnd, buf.data(), len + 1);
+    buf.resize(copied > 0 ? (size_t)copied : 0);
     return buf;
 }
 
@@ -1240,6 +1246,8 @@ inline std::wstring GetDynamicWindowText(HWND hwnd) {
 //     但 g_hChartBmp 由 RebuildChartCache 重建,所以只要 RebuildChartCache
 //     和 statsChar 写入都在主线程串行,就不需要锁
 //   - g_processing 标志防止 worker 跑时重复触发(双开 worker)
+//   - 线程句柄保留在 g_hWorker (主线程独占): 下次 Submit 开头与 WM_DESTROY 时
+//     join + CloseHandle, 保证进程退出前 worker 已完整走完 CRT 尾声 (见 WM_DESTROY)
 // ---------------------------------------------------------
 
 #define WM_APP_PROCESS_DONE  (WM_APP + 1)
@@ -1283,6 +1291,13 @@ struct ProcessOutput {
 
 // 用全局原子防双开;Win32 上 LONG volatile + InterlockedExchange 等价于 atomic_flag
 static volatile LONG g_processing = 0;
+
+// worker 线程句柄, 仅主线程读写。生命周期: Submit 创建 → (a) 下次 Submit 开头
+// join+close (此刻上一个 worker 早已投递结果/自清理, 最多剩微秒级 CRT 尾声), 或
+// (b) WM_DESTROY join+close (退出前兜底)。不在 Consume 里关闭: 投递结果 ≠ 线程已
+// 退出, 提前关闭会失去 join 能力, 留下 "ExitProcess 终止恰好持有 CRT 堆锁的尾声
+// 线程 → 退出挂死" 的风险窗口。
+static HANDLE g_hWorker = NULL;
 
 // Worker 线程入口:纯 CPU 工作,不碰任何 GUI。
 // 用 _beginthreadex 启动 (见 ProcessFile_Submit), 故签名是 unsigned __stdcall(void*) ——
@@ -1388,8 +1403,9 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
     if (temps.empty()) {
         out->ok = false;
         out->errMsg = L"JSON 解析失败或无数据。";
-        // 若主窗口已销毁 (用户在 worker 跑完前关窗), PostMessageW 会失败 (HWND 失效),
-        // 没人会消费 out → worker 自己负责清理, 否则泄漏 ProcessOutput + mmap 句柄, 且
+        // 防御分支: v0.1.3.3 起 WM_DESTROY 会先 join 本线程再销毁窗口, "关窗导致 HWND
+        // 失效"已不会发生; PostMessageW 仍可能因极端情况失败 (如线程消息队列满 10000 条)。
+        // 失败则没人消费 out → worker 自己清理, 否则泄漏 ProcessOutput + mmap 句柄, 且
         // g_processing 卡在 1。out 在 Submit 里已 release 给 worker, 此处归 worker 所有。
         if (!PostMessageW(out->hwnd_main, WM_APP_PROCESS_DONE, 0, (LPARAM)out)) {
             delete out;
@@ -1520,9 +1536,12 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
     out->outMsg = outMsg;
     out->ok = true;
 
-    // 同上: 关窗后 HWND 失效会让 PostMessageW 失败, worker 自行清理避免泄漏。
-    // (残留的窄窗口: HWND 仍有效、消息已入队但消息循环恰好已退出 —— 那种情况下泄漏发生在
-    //  进程退出的一瞬, 由 OS 在 ExitProcess 统一回收, 无实际危害, 故不再额外加线程 join。)
+    // 同上的防御分支 (消息队列满等极端失败)。窗口关闭路径已由 WM_DESTROY 收口:
+    // 先 join 本线程 (彼时 hwnd 仍有效, 本行 PostMessageW 必然成功入队), 再 reap 队列里
+    // 这条永远不会被派发的结果消息并释放载荷 —— 见 WndProc 的 WM_DESTROY。
+    // (v0.1.3.3 修正: 旧注释称"由 ExitProcess 统一回收, 无实际危害, 不加 join" —— 结论
+    //  不成立: ExitProcess 会直接终止其它线程, worker 若恰好在 CRT 堆锁内被终止, 退出
+    //  流程可能挂死。现已改为退出前必 join, 该风险窗口不复存在。)
     if (!PostMessageW(out->hwnd_main, WM_APP_PROCESS_DONE, 0, (LPARAM)out)) {
         delete out;
         InterlockedExchange(&g_processing, 0);
@@ -1578,12 +1597,21 @@ bool ProcessFile_Submit(HWND hwnd, const std::wstring& path) {
         return false;
     }
 
+    // v0.1.3.3: 回收上一个 worker 的句柄 (若有)。能走到这里说明 CAS 已拿到锁, 即上一个
+    // worker 已投递结果 (Consume 清零 g_processing) 或已自清理 —— 其线程最多只剩微秒级的
+    // CRT 尾声, 此处 join 几乎不阻塞, 换来句柄零泄漏 + 任意时刻至多一个未决句柄。
+    if (g_hWorker) {
+        WaitForSingleObject(g_hWorker, INFINITE);
+        CloseHandle(g_hWorker);
+        g_hWorker = NULL;
+    }
+
     // 启动 worker。v0.1.3.2: 2MB PMR arena 已挪到堆 (见 ProcessFile_Worker), worker 栈需求很小,
     // 故 stack_size 传 0 (用 EXE 默认栈大小), 不再需要 4MB + STACK_SIZE_PARAM_IS_A_RESERVATION。
     //
     // 仍用 _beginthreadex 而非裸 CreateThread: worker 大量使用 CRT (std::string / unordered_map /
     // swprintf / std::ranges::sort / 异常), 应走 CRT 线程入口以正确初始化/清理 per-thread 状态;
-    // 裸 CreateThread 跑 CRT 在极端低内存下有终止进程的风险。返回的句柄需 CloseHandle。
+    // 裸 CreateThread 跑 CRT 在极端低内存下有终止进程的风险。
     uintptr_t raw = _beginthreadex(nullptr, 0,
                                    ProcessFile_Worker, out.get(),
                                    0, nullptr);
@@ -1591,8 +1619,9 @@ bool ProcessFile_Submit(HWND hwnd, const std::wstring& path) {
         InterlockedExchange(&g_processing, 0);
         return false;
     }
-    HANDLE hThread = reinterpret_cast<HANDLE>(raw);
-    CloseHandle(hThread);  // 用 PostMessage 同步, 不 join; _beginthreadex 的句柄仍需 CloseHandle
+    // v0.1.3.3: 句柄不再立即 CloseHandle —— 保留在 g_hWorker 供 join (下次 Submit 开头 /
+    // WM_DESTROY 兜底), 保证退出前 worker 完整走完, 杜绝 ExitProcess 截杀尾声线程。
+    g_hWorker = reinterpret_cast<HANDLE>(raw);
     out.release();         // worker 接管所有权, 完成时主线程在 WM_APP_PROCESS_DONE 里 delete
     return true;
 }
@@ -2432,6 +2461,15 @@ void RebuildChartCache(HWND hwnd) {
     HDC hdcMem = CreateCompatibleDC(hdcWnd);
     if (g_hChartBmp) DeleteObject(g_hChartBmp);
     g_hChartBmp = CreateCompatibleBitmap(hdcWnd, w, h);
+    // v0.1.3.3: DC / 位图创建失败 (极端低资源、超大窗口) 时早退。旧逻辑会把 NULL 选进
+    // hdcMem 继续画 (落在默认 1x1 位图上, 不崩但全部白画); WM_PAINT 端本就有空检查,
+    // 这里补对称守卫, 失败时保持 g_hChartBmp = NULL 走"无缓存"路径。
+    if (!hdcMem || !g_hChartBmp) {
+        if (g_hChartBmp) { DeleteObject(g_hChartBmp); g_hChartBmp = NULL; }
+        if (hdcMem) DeleteDC(hdcMem);
+        ReleaseDC(hwnd, hdcWnd);
+        return;
+    }
 
     HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, g_hChartBmp);
     FillRect(hdcMem, &rc, (HBRUSH)(COLOR_WINDOW + 1));
@@ -2612,6 +2650,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     case WM_ERASEBKGND: return 1;
     case WM_DESTROY: {
+        // v0.1.3.3: 退出前先 join worker。此刻 hwnd 仍有效, worker 的 PostMessageW 仍能
+        // 成功入队; worker 从不 SendMessage 回主线程 (只用非阻塞 PostMessage), 故这里等待
+        // 不会死锁。等待时长 = 剩余分析时间 (本工具数据量下为毫秒级)。
+        // 不等待的后果: WinMain 返回 → ExitProcess 直接终止 worker, 其若恰好持有 CRT 堆锁,
+        // 退出流程可能挂死 —— 这才是真实风险 (旧注释"OS 统一回收、无实际危害"不成立)。
+        if (g_hWorker) {
+            WaitForSingleObject(g_hWorker, INFINITE);
+            CloseHandle(g_hWorker);
+            g_hWorker = NULL;
+        }
+        // join 之后, 若 worker 投递过结果, 该消息还躺在线程队列里且永远不会被派发
+        // (窗口即将销毁) —— 在此 reap 并释放载荷, 否则 ProcessOutput + mmap 句柄泄漏到
+        // 进程退出。与 Consume 不会双重 delete: 消息要么已派发 (队列里没有), 要么在队列
+        // 里 (未派发), 二者互斥; reap 只删队列里取出的那份。
+        MSG pending;
+        while (PeekMessageW(&pending, hwnd, WM_APP_PROCESS_DONE, WM_APP_PROCESS_DONE, PM_REMOVE)) {
+            delete reinterpret_cast<ProcessOutput*>(pending.lParam);
+        }
+        InterlockedExchange(&g_processing, 0);
         if (g_hChartBmp) { DeleteObject(g_hChartBmp); g_hChartBmp = NULL; }
         if (hFont) DeleteObject(hFont);
         PostQuitMessage(0);
