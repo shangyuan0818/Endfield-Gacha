@@ -202,7 +202,13 @@ struct WinHttpHandle {
 // ---------------------------------------------------------
 // [FetchPath - 修复 WinHttpQueryDataAvailable 失败死循环]
 // ---------------------------------------------------------
-std::string FetchPath(HINTERNET hConnect, const std::wstring& path) {
+// v0.1.3.3: 增加 netOk 出参 —— 旧版把"读流中途失败"与"读到自然结束"混为一谈, 都静默返回
+// 已收到的部分字节。截断恰好落在 list 中段时, 解析端能读出 code:0 与若干完整记录, 而
+// "hasMore" 键缺失会被当成 false → 看似自然翻页结束 → 部分数据被当完整数据提交, 形成
+// 记录缺口且【无任何报错】。现在: 仅 HTTP 200 且响应体完整读毕才置 netOk=true; 任一环节
+// (打开/发送/接收/状态码/可用量查询/读取) 失败都置 false, 由调用方按失败处理。
+std::string FetchPath(HINTERNET hConnect, const std::wstring& path, bool& netOk) {
+    netOk = false;
     HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(), NULL,
                                             WINHTTP_NO_REFERER,
                                             WINHTTP_DEFAULT_ACCEPT_TYPES,
@@ -215,26 +221,39 @@ std::string FetchPath(HINTERNET hConnect, const std::wstring& path) {
               WinHttpReceiveResponse(hRequest, NULL);
 
     if (ok) {
+        DWORD status = 0, statusSize = sizeof(status);
+        ok = WinHttpQueryHeaders(hRequest,
+                                 WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
+                                 WINHTTP_NO_HEADER_INDEX) &&
+             status == 200;
+    }
+
+    if (ok) {
         // 固定 16KB 复用缓冲: 不再为 >8KB 的区块反复 new/销毁 std::vector<char>。
         // WinHttpQueryDataAvailable 给出当前可读字节数, 再用固定缓冲分块读完该批。
         std::array<char, 16384> readBuf;
+        bool readFailed = false;
         bool reading = true;
         while (reading) {
             DWORD available = 0;
-            if (!WinHttpQueryDataAvailable(hRequest, &available) || available == 0) break;
+            if (!WinHttpQueryDataAvailable(hRequest, &available)) { readFailed = true; break; }
+            if (available == 0) break;   // 自然结束 (与查询失败区分开)
             while (available > 0) {
                 DWORD bufSz = (DWORD)readBuf.size();
                 DWORD chunk  = (available < bufSz) ? available : bufSz;
                 DWORD downloaded = 0;
                 if (!WinHttpReadData(hRequest, readBuf.data(), chunk, &downloaded) ||
                     downloaded == 0) {
-                    reading = false;   // 读失败或读到 0: 彻底结束 (与原版 break 整个循环一致)
+                    readFailed = true;   // 读失败 / 流提前终止: 不可当自然结束
+                    reading = false;
                     break;
                 }
                 response.append(readBuf.data(), downloaded);
                 available -= downloaded;
             }
         }
+        netOk = !readFailed;
     }
     WinHttpCloseHandle(hRequest);
     return response;
@@ -296,26 +315,17 @@ struct BufferedWriter {
         pos += len;
     }
 
-    void WriteEscaped(std::string_view s) {
-        const char* p = s.data();
-        const char* end = p + s.size();
-        while (p < end) {
-            const char* clean = p;
-            while (p < end && *p != '"' && *p != '\\') ++p;
-            if (p > clean) Write(clean, (DWORD)(p - clean));
-            if (p < end) {
-                if (*p == '"') WriteLit("\\\"");
-                else           WriteLit("\\\\");
-                ++p;
-            }
-        }
-    }
-
+    // v0.1.3.3: WriteKV 的 val 全部来自 ExtractJsonValue 的【原始转义形态】视图 (扫描器
+    // 不解码转义, 返回引号之间的原文, 例如 `\"` 仍是反斜杠+引号两个字符), 本就是合法的
+    // JSON 字符串内容, 必须【原样写出】。旧版 WriteEscaped 在其上再转义一遍, 会把 `\`
+    // 翻倍 (`\"` → `\\\"`), 解码后凭空多出反斜杠 —— 每导出一轮膨胀一次, 破坏往返幂等。
+    // 游戏名称目前不含 `"` / `\`, 属潜伏缺陷, 但口径必须正确。(若日后需要写【程序生成】
+    // 的字符串值, 那才需要转义; 本文件已无此类调用, WriteEscaped 一并移除以防误用。)
     void WriteKV(std::string_view key, std::string_view val) {
         WriteLit("            \"");
         Write(key);
         WriteLit("\": \"");
-        WriteEscaped(val);
+        Write(val);          // 原始转义形态, 原样写出
         WriteLit("\"");
     }
 
@@ -514,6 +524,11 @@ int main() {
 
     std::string tokenStr(token), serverIdStr(serverId);
 
+    // v0.1.3.3: 翻页中途异常停止保护。本池已吃进部分新记录后再异常停止时, 若照常写盘,
+    // 部分新记录一旦落地, 下次增量拉取在最新记录处即触达老记录而停 —— 中间缺失的更早
+    // 页【永远不会回补】。置位后整次更新中止、不写盘。语义与 macOS / iOS 端对齐。
+    bool fetchAborted = false;
+
     for (const auto& poolCfg : pools) {
         printf("\n>>> 正在抓取 [%s] ...\n", poolCfg.displayName.c_str());
         bool hasMore = true, reachedExisting = false;
@@ -531,22 +546,28 @@ int main() {
                 currentPath.append("&seq_id=").append(seqIdBuf, ptr - seqIdBuf);
             }
 
-            networkPayloads.emplace_back(FetchPath(hConnect, Utf8ToWstring(currentPath)));
+            bool netOk = false;
+            networkPayloads.emplace_back(FetchPath(hConnect, Utf8ToWstring(currentPath), netOk));
             std::string_view resView = networkPayloads.back();
 
-            if (resView.empty()) {
-                printf("  [错误] 网络请求失败或 Token 已失效。\n");
+            // 三个异常分支: 页 1 失败 (poolFetchedCount == 0, 本池无部分状态, 无缺口风险)
+            // 维持宽松跳池; 翻页中途失败升级为整次中止 (见 fetchAborted 声明处注释)。
+            if (!netOk || resView.empty()) {
+                printf("  [错误] 网络请求失败、响应不完整或 Token 已失效。\n");
+                if (poolFetchedCount > 0) fetchAborted = true;
                 break;
             }
 
             std::string_view codeStr = ExtractJsonValue(resView, "code", false);
             if (codeStr.empty()) {
                 printf("  [错误] 接口返回了非 JSON 数据或格式异常。\n");
+                if (poolFetchedCount > 0) fetchAborted = true;
                 break;
             }
             if (codeStr != "0") {
                 auto msgStr = ExtractJsonValue(resView, "msg", true);
                 printf("  [提示] 接口返回信息: %.*s\n", (int)msgStr.size(), msgStr.data());
+                if (poolFetchedCount > 0) fetchAborted = true;
                 break;
             }
 
@@ -570,6 +591,9 @@ int main() {
                 if (sessionIds.contains(safeUniqueId)) {
                     printf("\n  [警告] 遇到重复数据 (ID: %lld),防死循环中止。\n", rawSeqId);
                     hasMore = false;
+                    // v0.1.3.3: 重复数据 = 分页游标异常 (服务器返回未推进)。已吃进部分新
+                    // 记录时与下方未拉取的历史之间存在缺口, 同样升级为整次中止。
+                    if (poolFetchedCount > 0) fetchAborted = true;
                     return;
                 }
                 sessionIds.insert(safeUniqueId);
@@ -616,9 +640,21 @@ int main() {
             page++;
             Sleep(300);
         }
+        if (fetchAborted) {
+            printf(">>> [%s] 拉取在翻页中途异常停止。\n", poolCfg.displayName.c_str());
+            break;   // 后续池无需再拉, 本次整体不写盘
+        }
         printf(">>> [%s] 抓取完成,本次新增拉取: %d 条。\n",
                poolCfg.displayName.c_str(), poolFetchedCount);
         Sleep(500);
+    }
+
+    if (fetchAborted) {
+        printf("\n========================================\n");
+        printf("本次拉取在翻页中途异常停止: 为避免写入带缺口的记录历史, 本次【不写盘】,\n");
+        printf("原记录文件保持原样。请稍后重新运行以完整拉取。\n");
+        system("pause");
+        return 1;
     }
 
     printf("\n========================================\n");
