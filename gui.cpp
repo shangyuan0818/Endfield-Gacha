@@ -2713,9 +2713,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ShowWindow(hwnd, nCmdShow);
 
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
+    // v0.1.3.3: GetMessage 的返回值是三态 (>0 取到消息 / 0 收到 WM_QUIT / -1 出错),
+    // 旧写法 while (GetMessage(...)) 把 -1 当真值 —— 出错时 msg 内容未定义, 循环会带着
+    // 无效消息空转。当前参数 (hwnd=NULL 过滤 + 有效指针) 下 -1 实际不可达, 属防御性修正;
+    // 顺带显式用 W 版 (GetMessageW / DispatchMessageW), 与本文件全 W 系窗口代码一致,
+    // 不再依赖 UNICODE 宏决定 A/W。
+    for (;;) {
+        BOOL ret = GetMessageW(&msg, NULL, 0, 0);
+        if (ret == 0)  break;   // WM_QUIT: 正常退出
+        if (ret == -1) break;   // 错误: msg 未定义, 不可 Dispatch, 直接进入清理
         TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        DispatchMessageW(&msg);
     }
     Gdiplus::GdiplusShutdown(gdiplusToken);
     return 0;
