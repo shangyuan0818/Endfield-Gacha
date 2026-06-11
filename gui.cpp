@@ -20,6 +20,7 @@
 #include <ranges>
 #include <memory_resource>
 #include <array>
+#include <span>           // v0.1.3.3: 理论 CDF 表改用 std::span 传参
 #include <cstdint>
 #include <memory>      // std::make_unique_for_overwrite (C++20) —— worker 的 2MB PMR arena 用它在堆上不清零分配
 #include <process.h>   // _beginthreadex / _endthreadex(调用 CRT 的线程应走这个而非裸 CreateThread)
@@ -833,7 +834,10 @@ void InitCDFTables() {
 // 原版用 fn_before 减 cdf_table[x] —— 拿经验阶梯底对理论阶梯顶,
 // 人为引入 h_x 的单点跳跃(软保底段可高达 5%+),造成巨大伪偏差
 double ComputeKS(const std::array<int, 260>& freq, int max_pity, int n,
-                 const double* cdf_table, int cdf_len) {
+                 std::span<const double> cdf_table) {
+    // v0.1.3.3: "裸指针 + 长度"两个散参 → std::span (C++20)。长度随表走,
+    // 调用方不可能再把表和长度传错配对; 函数体保留局部 cdf_len, 下方逻辑零改动。
+    const int cdf_len = (int)cdf_table.size();
     if (n == 0) return 0.0;
     // 防御性 clamp: freq 数组容量 260,max_pity 必须 < 260 否则越界读
     if (max_pity > 259) max_pity = 259;
@@ -1097,10 +1101,11 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         s.ci_all_err = t_crit * std_all / std::sqrt((double)acc.count_all);
 
         // K-S 检验:角色池用 g_cdf_char(ggpipi 模型),武器池用 g_cdf_wep(Reddit 模型)
-        const double* cdf_tbl = isWeapon ? g_cdf_wep : g_cdf_char;
-        int cdf_len = isWeapon ? 41 : 82;
+        const std::span<const double> cdf_tbl = isWeapon
+            ? std::span<const double>(g_cdf_wep)      // 41
+            : std::span<const double>(g_cdf_char);    // 82
         s.ks_d_all = ComputeKS(acc.freq_all, acc.max_pity_all, acc.count_all,
-                               cdf_tbl, cdf_len);
+                               cdf_tbl);
         s.ks_is_normal = (s.ks_d_all <= (1.36 / std::sqrt((double)acc.count_all)));
     }
 
@@ -1133,11 +1138,10 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         // v0.1.2.2: 辉光庆典走 g_cdf_joint_up (真实前向迭代, n=30 处展开免费十连)
         // 注意 isJoint 时 freq_up 的"事件"语义是"距上次限定的抽数", 与 g_cdf_joint_up
         // 描述的"首次非常驻六星"分布一致 (因为 pity_since_last_up 在每次出限定后重置)。
-        const double* cdf_up_tbl;
-        int cdf_up_len;
-        if (isWeapon)      { cdf_up_tbl = g_cdf_wep_up;   cdf_up_len = 81;  }
-        else if (isJoint)  { cdf_up_tbl = g_cdf_joint_up; cdf_up_len = 242; }
-        else               { cdf_up_tbl = g_cdf_char_up;  cdf_up_len = 122; }
+        std::span<const double> cdf_up_tbl;          // v0.1.3.3: 长度由 span 自带
+        if (isWeapon)      cdf_up_tbl = g_cdf_wep_up;    // 81
+        else if (isJoint)  cdf_up_tbl = g_cdf_joint_up;  // 242
+        else               cdf_up_tbl = g_cdf_char_up;   // 122
         if (isWeapon) {
             // v0.1.3.3 武器 UP K-S: 先把经验 freq_up 按申领 (10 抽) 粒度向上聚合再比较。
             // 原因: g_cdf_wep_up 的质量只在 10 倍数边界记账 (申领内平坦, 机制如此),
@@ -1157,10 +1161,10 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
             int max_claim = ((acc.max_pity_up + 9) / 10) * 10;
             if (max_claim > 259) max_claim = 259;
             s.ks_d_up = ComputeKS(freq_up_claim, max_claim, acc.count_up,
-                                  cdf_up_tbl, cdf_up_len);
+                                  cdf_up_tbl);
         } else {
             s.ks_d_up = ComputeKS(acc.freq_up, acc.max_pity_up, acc.count_up,
-                                  cdf_up_tbl, cdf_up_len);
+                                  cdf_up_tbl);
         }
         s.ks_is_normal_up = (s.ks_d_up <= (1.36 / std::sqrt((double)acc.count_up)));
     }
@@ -1632,8 +1636,8 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
               const std::array<int, 260>& freq_all, const std::array<int, 260>& freq_up,
               int count_all, int count_up,
               [[maybe_unused]] int censored_all, [[maybe_unused]] int censored_up,
-              const double* theory_cdf_all, int theory_cdf_all_len,
-              const double* theory_cdf_up,  int theory_cdf_up_len,
+              std::span<const double> theory_cdf_all,
+              std::span<const double> theory_cdf_up,
               const std::wstring& title, int limit_base,
               int ecdf_up_step_size = 1) {
     Gdiplus::SolidBrush bgBrush(Gdiplus::Color(255, 252, 253, 255));
@@ -1734,9 +1738,10 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     // 画法: 用 GraphicsPath 攒整条路径再一次性 stroke,
     //       dash pattern 沿连续路径走, 跨拐角不重启;
     //       LineJoin=Round 让拐角圆滑过渡, 缓解 dash 实部压在 90° 角的视觉错乱。
-    auto drawTheoryCDF = [&](const double* cdf, int cdf_len,
+    auto drawTheoryCDF = [&](std::span<const double> cdf,
                              int stepSize, Gdiplus::Color color) {
-        if (!cdf || cdf_len < 2) return;
+        const int cdf_len = (int)cdf.size();   // v0.1.3.3: span 自带长度
+        if (cdf_len < 2) return;
         Gdiplus::Pen pen(color, DPIScaleF(1.5f));
         Gdiplus::REAL dash[2] = { DPIScaleF(4.0f), DPIScaleF(3.0f) };
         pen.SetDashPattern(dash, 2);
@@ -1841,8 +1846,8 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         g.DrawLine(&pen, prev_pt.X, prev_pt.Y, end_pt.X, end_pt.Y);
     };
 
-    drawTheoryCDF(theory_cdf_all, theory_cdf_all_len, 1,                Gdiplus::Color(180, 65, 140, 240));
-    drawTheoryCDF(theory_cdf_up,  theory_cdf_up_len,  ecdf_up_step_size, Gdiplus::Color(180, 240, 80, 80));
+    drawTheoryCDF(theory_cdf_all, 1,                 Gdiplus::Color(180, 65, 140, 240));
+    drawTheoryCDF(theory_cdf_up,  ecdf_up_step_size, Gdiplus::Color(180, 240, 80, 80));
     drawEmpiricalECDF(freq_all, count_all, Gdiplus::Color(255, 65, 140, 240));
     drawEmpiricalECDF(freq_up,  count_up,  Gdiplus::Color(255, 240, 80, 80));
 
@@ -1857,10 +1862,11 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     // 标签自带白色描边 (4 偏移方向先画白色底字再叠主文本), 在彩色实线上的可读性更好。
     enum class KSLabelAnchor { LeftTop, RightBottom };
     auto drawKSMarker = [&](const std::array<int, 260>& freq, int total,
-                            const double* cdf, int cdf_len,
+                            std::span<const double> cdf,
                             BYTE r, BYTE gC, BYTE b,
                             KSLabelAnchor anchor) {
-        if (total == 0 || !cdf || cdf_len < 2) return;
+        const int cdf_len = (int)cdf.size();   // v0.1.3.3: span 自带长度
+        if (total == 0 || cdf_len < 2) return;
         // v0.1.2.4: 同 drawTheoryCDF / computeTheoryMRL, 加 upper_eff 截断避免:
         //   - 辉光池 cdf[241]=0 (未填充哨兵段) 让 |cum - 0| ≈ 1, 误判为最大偏离点
         //   - 饱和段 (cdf[k]==1 after hard pity) 上做无意义的比较
@@ -1925,10 +1931,10 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         g.DrawString(lbl, -1, &tickFont, Gdiplus::PointF(tx, ty), &mainBr);
     };
     // 蓝色 (综合): 左上
-    drawKSMarker(freq_all, count_all, theory_cdf_all, theory_cdf_all_len,
+    drawKSMarker(freq_all, count_all, theory_cdf_all,
                  65, 140, 240, KSLabelAnchor::LeftTop);
     // 红色 (UP): 右下
-    drawKSMarker(freq_up, count_up, theory_cdf_up, theory_cdf_up_len,
+    drawKSMarker(freq_up, count_up, theory_cdf_up,
                  240, 80, 80, KSLabelAnchor::RightBottom);
 
     // 图例 (3 项水平排列: 综合实线 / UP 实线 / 理论 CDF 虚线)
@@ -2027,8 +2033,8 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
              const std::array<int, 260>& freq_up,
              int count_all, int count_up,
              int censored_all, int censored_up,
-             const double* theory_cdf_all, int theory_cdf_all_len,
-             const double* theory_cdf_up,  int theory_cdf_up_len,
+             std::span<const double> theory_cdf_all,
+             std::span<const double> theory_cdf_up,
              const std::wstring& title, int limit_base,
              int theory_all_cap = 0, int theory_up_cap = 0,
              double tail_mean_excess_up = 0.0) {
@@ -2090,9 +2096,10 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     auto mrl_up  = computeEmpiricalMRL(freq_up,  count_up);
 
     // ---- 计算理论 MRL (基于理论 CDF, 可选长尾解析延伸) ----
-    auto computeTheoryMRL = [&](const double* cdf, int cdf_len, double tail_mean_excess = 0.0) {
+    auto computeTheoryMRL = [&](std::span<const double> cdf, double tail_mean_excess = 0.0) {
         std::array<double, 260> tmrl{}; tmrl.fill(-1.0);
-        if (!cdf || cdf_len < 2) return tmrl;
+        const int cdf_len = (int)cdf.size();   // v0.1.3.3: span 自带长度
+        if (cdf_len < 2) return tmrl;
         int upper = cdf_len - 1;  // CDF 最大有效索引
         // v0.1.2.2: 与 drawTheoryCDF 同样的 upper_eff 截断逻辑, 避免:
         //   1) 饱和段 (cdf[k]==1 after hard pity): 不必再算
@@ -2129,8 +2136,8 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         }
         return tmrl;
     };
-    auto theory_mrl_all = computeTheoryMRL(theory_cdf_all, theory_cdf_all_len);
-    auto theory_mrl_up  = computeTheoryMRL(theory_cdf_up,  theory_cdf_up_len, tail_mean_excess_up);
+    auto theory_mrl_all = computeTheoryMRL(theory_cdf_all);
+    auto theory_mrl_up  = computeTheoryMRL(theory_cdf_up, tail_mean_excess_up);
 
     // ---- Y 轴范围: 取所有 MRL 值的最大值 ----
     double max_y = 1.0;
@@ -2451,7 +2458,7 @@ void RebuildChartCache(HWND hwnd) {
                    statsChar.freq_all, statsChar.freq_up,
                    statsChar.count_all, statsChar.count_up,
                    statsChar.censored_pity_all, statsChar.censored_pity_up,
-                   g_cdf_char, 82, g_cdf_char_up, 122,
+                   g_cdf_char, g_cdf_char_up,
                    L"角色 (特许寻访) 累积分布 (ECDF)", 120,
                    /*ecdf_up_step_size=*/1);
         // 角色 MRL: X=80 是综合 6 星硬保底 (理论 MRL 上限), X=120 是 UP 硬保底
@@ -2459,7 +2466,7 @@ void RebuildChartCache(HWND hwnd) {
                    statsChar.freq_all, statsChar.freq_up,
                    statsChar.count_all, statsChar.count_up,
                    statsChar.censored_pity_all, statsChar.censored_pity_up,
-                   g_cdf_char, 82, g_cdf_char_up, 122,
+                   g_cdf_char, g_cdf_char_up,
                    L"角色 (特许寻访) 剩余抽数期望 (MRL)", 120,
                    /*theory_all_cap=*/80, /*theory_up_cap=*/120);
 
@@ -2484,14 +2491,14 @@ void RebuildChartCache(HWND hwnd) {
                    statsJoint.freq_all, statsJoint.freq_up,
                    statsJoint.count_all, statsJoint.count_up,
                    statsJoint.censored_pity_all, statsJoint.censored_pity_up,
-                   g_cdf_char, 82, g_cdf_joint_up, 242,
+                   g_cdf_char, g_cdf_joint_up,
                    L"角色 (辉光庆典) 累积分布 (ECDF)", 240,
                    /*ecdf_up_step_size=*/1);
         DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(645), DPIScale(600), DPIScale(250)),
                    statsJoint.freq_all, statsJoint.freq_up,
                    statsJoint.count_all, statsJoint.count_up,
                    statsJoint.censored_pity_all, statsJoint.censored_pity_up,
-                   g_cdf_char, 82, g_cdf_joint_up, 242,
+                   g_cdf_char, g_cdf_joint_up,
                    L"角色 (辉光庆典) 剩余抽数期望 (MRL)", 240,
                    /*theory_all_cap=*/80, /*theory_up_cap=*/240,
                    /*tail_mean_excess_up=*/g_joint_tail_mean_excess);
@@ -2504,7 +2511,7 @@ void RebuildChartCache(HWND hwnd) {
                    statsWep.freq_all, statsWep.freq_up,
                    statsWep.count_all, statsWep.count_up,
                    statsWep.censored_pity_all, statsWep.censored_pity_up,
-                   g_cdf_wep, 41, g_cdf_wep_up, 81,
+                   g_cdf_wep, g_cdf_wep_up,
                    L"武器累积分布 (ECDF)", 80,
                    /*ecdf_up_step_size=*/10);
         // 武器 MRL: X=40 综合硬保底, X=80 UP 硬保底
@@ -2512,7 +2519,7 @@ void RebuildChartCache(HWND hwnd) {
                    statsWep.freq_all, statsWep.freq_up,
                    statsWep.count_all, statsWep.count_up,
                    statsWep.censored_pity_all, statsWep.censored_pity_up,
-                   g_cdf_wep, 41, g_cdf_wep_up, 81,
+                   g_cdf_wep, g_cdf_wep_up,
                    L"武器剩余抽数期望 (MRL)", 80,
                    /*theory_all_cap=*/40, /*theory_up_cap=*/80);
     }
