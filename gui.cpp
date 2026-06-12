@@ -2679,7 +2679,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
-    LoadLibrary(L"Msftedit.dll");
+    // v0.1.3.3: RichEdit50W 依赖 Msftedit.dll。消费级 Windows (含 N 版) 均随系统分发,
+    // 仅 WinPE / 深度精简系统可能缺失 —— 旧版忽略返回值, 缺失时四个 RichEdit 创建为 NULL,
+    // 后续 SendMessage / SetWindowText 全部静默落空, 界面空白且无任何提示。现显式报错退出。
+    if (!LoadLibraryW(L"Msftedit.dll")) {
+        MessageBoxW(NULL,
+                    L"无法加载 Msftedit.dll (RichEdit 控件库)。\n"
+                    L"本程序的文本界面依赖该系统组件, 请在完整版 Windows 上运行。",
+                    L"组件缺失", MB_OK | MB_ICONERROR);
+        return 1;
+    }
     SetProcessDPIAware();
     HDC hdcScreen = GetDC(NULL);
     g_dpi = GetDeviceCaps(hdcScreen, LOGPIXELSX);
