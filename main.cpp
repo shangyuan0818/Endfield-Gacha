@@ -108,15 +108,18 @@ inline std::string_view ExtractJsonValue(std::string_view source, std::string_vi
     }
 }
 
-// O(N) 逐字符扫描
+// O(N) 逐字符扫描。
+// v0.1.3.3 (A2): 返回值改为 bool —— 是否定位到了 "arrayKey": [ ... ] 数组结构 (数组为空也算
+// 定位成功)。基底加载用它区分"结构正确的空数据"(正常, 0 条) 与"无结构的损坏/异类文件"
+// (中止, 防止覆盖原历史)。原有调用方不取返回值, 行为不变。
 template<typename Callback>
-void ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callback&& cb) {
+bool ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callback&& cb) {
     size_t pos = FindJsonKey(source, arrayKey);
-    if (pos == std::string_view::npos) return;
+    if (pos == std::string_view::npos) return false;
     pos = source.find(':', pos + arrayKey.length() + 2);
-    if (pos == std::string_view::npos) return;
+    if (pos == std::string_view::npos) return false;
     pos = source.find('[', pos);
-    if (pos == std::string_view::npos) return;
+    if (pos == std::string_view::npos) return false;
 
     int depth = 0;
     size_t objStart = 0;
@@ -140,6 +143,7 @@ void ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callb
             break;
         }
     }
+    return true;   // 已定位数组 (即便其中 0 个对象)
 }
 
 inline std::wstring Utf8ToWstring(std::string_view str) {
@@ -415,12 +419,18 @@ int main() {
     std::string uigfFilename = "uigf_endfield.json";
 
     // ---- 读取本地老记录(读完立即释放句柄,避免锁住目标文件)----
+    // v0.1.3.3 (A2) 基底验收口径: 文件【不存在】= 全新拉取 (正常); 文件存在但打不开 /
+    // 0 字节 / 映射失败 / 找不到 "list" 数组结构 = 按损坏处理, 中止且不写盘, 防止运行
+    // 结束时 MoveFileEx 覆盖原历史; "list" 数组存在但为空 = 结构正确的空数据, 0 条正常继续。
+    bool baseFileExists = false;   // 文件存在 (无论能否读)
+    bool baseLoadOk     = false;   // 打开 + 映射 + 结构 ("list" 数组) 三关全过
     {
         FileHandle hFile;
         hFile.h = CreateFileA(uigfFilename.c_str(), GENERIC_READ,
                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile.h != INVALID_HANDLE_VALUE) {
+            baseFileExists = true;
             // 与 gui.cpp 同步: GetFileSize (32 位, 截断 >4GB) → GetFileSizeEx (64 位) + size_t
             // 上界校验。本地 uigf 文件正常远小于 4GB, 但用 64 位读 + 显式校验更稳健
             // (尤其 32 位构建下 size_t 仅 4GB)。
@@ -453,7 +463,7 @@ int main() {
                             bufferView.remove_prefix(3);
                         }
 
-                        ForEachJsonObject(bufferView, "list", [&](std::string_view itemStr) {
+                        baseLoadOk = ForEachJsonObject(bufferView, "list", [&](std::string_view itemStr) {
                             std::string_view raw_id = ExtractJsonValue(itemStr, "id", true);
                             long long parsed_id = 0, parsed_ts = 0;
                             if (!raw_id.empty()) {
@@ -491,11 +501,26 @@ int main() {
                     }
                 }
             }
-            printf("成功加载本地存储的 %zu 条抽卡记录。\n", records.size());
+            if (baseLoadOk) {
+                printf("成功加载本地存储的 %zu 条抽卡记录。\n", records.size());
+            }
         } else {
-            printf("未发现本地记录,将创建新文件。\n");
+            DWORD openErr = GetLastError();
+            if (openErr == ERROR_FILE_NOT_FOUND || openErr == ERROR_PATH_NOT_FOUND) {
+                printf("未发现本地记录,将创建新文件。\n");
+            } else {
+                baseFileExists = true;   // 存在但打不开 (占用/权限): 按"存在但不可用"走下方中止
+            }
         }
     }  // <- Guard 全部析构,文件完全释放
+
+    if (baseFileExists && !baseLoadOk) {
+        printf("[错误] 本地记录文件 %s 存在, 但无法读取或不含 \"list\" 数组结构\n", uigfFilename.c_str());
+        printf("       (0 字节、被占用、已损坏或非本工具格式)。\n");
+        printf("       为防止本次运行结束时覆盖原有历史, 已中止。请检查或移走该文件后重试。\n");
+        system("pause");
+        return 1;
+    }
 
     std::wstring hostName = L"ef-webview.gryphline.com";
     if (inputUrl.find("hypergryph") != std::string_view::npos) {
@@ -581,7 +606,11 @@ int main() {
                 long long rawSeqId = 0;
                 std::from_chars(rawSeqIdStr.data(), rawSeqIdStr.data() + rawSeqIdStr.size(), rawSeqId);
                 lastSeqParsed = rawSeqId;
-                long long safeUniqueId = poolCfg.isWeapon ? -rawSeqId : rawSeqId;
+                // v0.1.3.3: 取反改无符号形式 —— 直接 -rawSeqId 在 rawSeqId==LLONG_MIN 时是
+                // 有符号溢出 UB。该值来自服务器正序列号, 实际不可达, 属零成本加固
+                // (与分析器 abs_ll 口径对齐); 无符号模运算取反 + 补码窄化全程有定义。
+                long long safeUniqueId = poolCfg.isWeapon
+                    ? (long long)(0ULL - (unsigned long long)rawSeqId) : rawSeqId;
 
                 if (local_safe_ids.contains(safeUniqueId)) {
                     reachedExisting = true;
