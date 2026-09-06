@@ -381,9 +381,30 @@ int main() {
     if (serverId.empty()) serverId = "1";
     printf("\n已自动识别 Server ID: %.*s\n", (int)serverId.size(), serverId.data());
 
+    // 角色寻访的 pool_type 枚举。
+    //
+    // v0.1.4.0 新增 E_CharacterGachaPoolType_Rerun (重构寻访 RE-Factor Headhunting):
+    //   1.5「雪凇幽梦」引入的第五种角色寻访类型, 首期「绚丽异彩」2026/09/24 12:00 开启,
+    //   poolId 形如 "rerun_chr_yvonne" (与其余四种一样, poolId 前缀 = 枚举后缀的小写)。
+    //
+    // 这个枚举值是【实测确认】的, 不是猜测 —— /api/record/char 会先校验 pool_type 再校验
+    // token, 所以不带有效 token 也能判定一个枚举名是否合法:
+    //     合法枚举 → {"code":40100,"msg":"Token is invalid"}
+    //     非法枚举 → {"code":40000,"msg":"Invalid pool_type"}
+    // 于是可以直接枚举出服务端接受的全集 (大小写敏感), 例如:
+    //     curl -sG 'https://ef-webview.gryphline.com/api/record/char' \
+    //          --data-urlencode 'lang=zh-cn' --data-urlencode 'token=x' \
+    //          --data-urlencode 'server_id=1' \
+    //          --data-urlencode 'pool_type=E_CharacterGachaPoolType_Rerun'
+    //   2026-09-06 实测: 服务端只接受下面这 5 个值, 没有第 6 个。
+    //   将来官方再加新池型时, 用同样的方法几秒就能试出新枚举名, 不需要等别人逆向。
+    //
+    // 武器记录接口没有 pool_type 参数, 所有武器池 (含 1.5 新增的「重构申领」
+    // rerun_wpn_*) 都在同一条 /api/record/weapon 时间线里返回, 无需在此登记。
     std::vector<PoolConfig> pools = {
         {"E_CharacterGachaPoolType_Special",  "角色 - 特许寻访", false},
         {"E_CharacterGachaPoolType_Joint",    "角色 - 辉光庆典", false},
+        {"E_CharacterGachaPoolType_Rerun",    "角色 - 重构寻访", false},
         {"E_CharacterGachaPoolType_Standard", "角色 - 基础寻访", false},
         {"E_CharacterGachaPoolType_Beginner", "角色 - 启程寻访", false},
         {"",                                   "武器 - 全历史记录", true}
@@ -606,6 +627,22 @@ int main() {
                 long long rawSeqId = 0;
                 std::from_chars(rawSeqIdStr.data(), rawSeqIdStr.data() + rawSeqIdStr.size(), rawSeqId);
                 lastSeqParsed = rawSeqId;
+
+                // v0.1.4.0:「寻访情报书」幽灵记录过滤。
+                //   特许寻访累计 60 抽会发一本【寻访情报书】(客户端 GachaCharPoolTypeTable
+                //   type=0 的 testimonialPullCount=60, 每个 special_* 池带 testimonialRewardItemId
+                //   如 "item_gacha_introletter_1_5_1")。该发放事件会作为一条记录混在
+                //   /api/record/char 的 list 里返回, 但它【不是一次寻访】: 有 seqId / gachaTs /
+                //   poolId, 却没有 charId / charName / rarity, 靠 kind == "gift_intel_book" 区分。
+                //   照单全收会污染 UIGF 导出与抽卡总数, 并让分析端的保底水位每 60 抽多算 1 抽。
+                //   (上游同类工具自 2026-08 起也都加了同一过滤, 见 bhaoo/endfield-gacha #44。)
+                //   重构寻访 type=4 的 testimonialPullCount=0, 不产生这类记录;
+                //   /api/record/weapon 侧也未观察到。
+                //
+                //   注意: 必须放在 lastSeqParsed 赋值【之后】—— 幽灵记录同样占用 seqId 序列,
+                //   若在更新翻页游标前就 return, 分页会卡住或漏页。
+                if (ExtractJsonValue(itemStr, "kind", true) == "gift_intel_book") return;
+
                 // v0.1.3.3: 取反改无符号形式 —— 直接 -rawSeqId 在 rawSeqId==LLONG_MIN 时是
                 // 有符号溢出 UB。该值来自服务器正序列号, 实际不可达, 属零成本加固
                 // (与分析器 abs_ll 口径对齐); 无符号模运算取反 + 补码窄化全程有定义。
@@ -757,7 +794,7 @@ int main() {
             w.Write(numBuf, (DWORD)(ptr - numBuf));
             w.WriteLit(",\n");
             w.WriteLit("        \"export_app\": \"Endfield Exporter\",\n"
-                       "        \"export_app_version\": \"v2.6.0\",\n"
+                       "        \"export_app_version\": \"v2.7.0\",\n"
                        "        \"version\": \"v4.2\",\n");
             // export_time 不在 v4.2 必需字段里,但保留作为人类可读辅助信息
             w.WriteLit("        \"export_time\": \""); w.Write(tbuf, tlen); w.WriteLit("\"\n    },\n");
