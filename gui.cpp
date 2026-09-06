@@ -369,6 +369,10 @@ struct StatsResult {
 
 StatsResult statsChar, statsWep, statsJoint, statsRefactor;
 HWND hOutEdit, hCharEdit, hWepEdit, hPoolMapEdit;
+// v0.1.4.0: 三个说明标签也提成全局 —— 窗口可缩放后每次 WM_SIZE / 滚动都要重新摆位
+HWND hHintLabel = NULL, hCharLabel = NULL, hPoolMapLabel = NULL, hWepLabel = NULL;
+static int g_scrollY  = 0;   // 当前垂直滚动量 (物理像素)
+static int g_contentH = 0;   // 最近一次布局算出的内容总高 (物理像素)
 static HBITMAP g_hChartBmp = NULL;
 int g_dpi = 96;
 int   DPIScale (int value)   { return MulDiv(value, g_dpi, 96); }
@@ -2683,10 +2687,161 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     }
 }
 
-void RebuildChartCache(HWND hwnd) {
+// ---------------------------------------------------------
+// [响应式布局 + 垂直滚动]  v0.1.4.0
+//
+// 参考 Apple 版 (shangyuan0818/Endfield-Gacha-Apple) macOS ContentView.swift 的做法:
+//   整个主区域套一层 ScrollView; 图表宽度撑满父容器 (maxWidth: .infinity),
+//   高度给 minHeight 保底, 窗口够高时几行图表平分剩余空间。
+//   原注释:「小屏 MacBook 缩小窗口时武器卡池/底部图表会被 Dock 或屏幕底端遮挡,
+//            这里让用户能滚动查看」——— Windows 端在加入第 4 行图表后是同样的问题。
+//
+// Win32 等价实现:
+//   - 窗口恢复可缩放 (WS_THICKFRAME | WS_MAXIMIZEBOX), 并加 WS_VSCROLL
+//   - 所有子控件与图表的坐标改由 ComputeLayout() 从客户区尺寸算出, 不再写死常量
+//   - 内容总高 > 客户区高时可滚动。滚动【不重绘图表】: 图表位图按"内容坐标系"缓存
+//     (高度 = contentH 而非客户区高), 滚动只改 BitBlt 的源点 Y 与子控件的 Y 偏移。
+//   - 滚动条用 SIF_DISABLENOSCROLL 常驻显示 (内容装得下时变灰而非隐藏)。这样客户区
+//     宽度不会因滚动条显隐而跳变, 避免 SetScrollInfo → WM_SIZE → SetScrollInfo 的
+//     重入抖动。
+//
+// 坐标约定: 下面 ui:: 里的 k* 常量是【逻辑像素】, Layout 结构体里的字段是
+//           【物理像素】(已过 DPIScale)。
+// ---------------------------------------------------------
+namespace ui {
+    constexpr int kMarginX      = 20;   // 左右留白
+    constexpr int kMarginBottom = 20;
+    constexpr int kLabelW       = 95;
+    constexpr int kEditX        = 120;  // 标签右侧, 输入框起点
+    constexpr int kHintY        = 15;
+    constexpr int kRowY0        = 40;   // 第一行输入框 (常驻六星角色)
+    constexpr int kRowStep      = 30;   // 行距
+    constexpr int kLabelDY      = 5;    // 标签相对同行输入框的垂直微调
+    constexpr int kEditH        = 26;
+    constexpr int kLabelH       = 20;
+    constexpr int kOutY         = 135;  // 输出文本框顶端
+    constexpr int kOutH         = 280;  // 输出文本框高度 (4 个池块)
+    constexpr int kChartGapX    = 20;   // 同一行左右两图之间
+    constexpr int kChartGapY    = 5;    // 上下两行之间
+    constexpr int kChartMinRowH = 250;  // 单行图表最小高度 (等价 Apple 的 minHeight)
+    constexpr int kChartRows    = 4;    // 特许 / 辉光 / 重构 / 武器
+    constexpr int kMinWindowW   = 900;  // 再窄图表就没法读了
+    constexpr int kMinWindowH   = 360;
+    constexpr int kScrollLine   = 30;   // 一次 SB_LINEUP/DOWN 的步长
+}
+
+struct Layout {
+    int clientW = 0, clientH = 0;   // 客户区尺寸 (物理像素)
+    int contentH = 0;               // 内容总高, 滚动范围的依据
+    int editX = 0, editW = 0;       // 三个配置输入框
+    int outY = 0, outH = 0, outW = 0;
+    int chartX1 = 0, chartX2 = 0;   // 左列 / 右列 X
+    int chartTop = 0, chartW = 0, chartRowH = 0;
+    // 第 i 行 (0-based) 图表的顶端 Y, 内容坐标系
+    int RowY(int i) const { return chartTop + i * (chartRowH + DPIScale(ui::kChartGapY)); }
+};
+
+Layout ComputeLayout(HWND hwnd) {
+    Layout L;
     RECT rc; GetClientRect(hwnd, &rc);
-    int w = rc.right, h = rc.bottom;
+    L.clientW = rc.right; L.clientH = rc.bottom;
+    if (L.clientW <= 0 || L.clientH <= 0) return L;
+
+    const int mx = DPIScale(ui::kMarginX);
+    L.editX = DPIScale(ui::kEditX);
+    // clamp 到一个正的最小值: 窗口被拖到极窄时 (WM_GETMINMAXINFO 之外仍可能发生,
+    // 例如最小化/还原过程中的瞬时尺寸) 避免出现负宽度传给 MoveWindow/位图。
+    L.editW = (std::max)(DPIScale(40), L.clientW - L.editX - mx);
+    L.outW  = (std::max)(DPIScale(40), L.clientW - 2 * mx);
+    L.outY  = DPIScale(ui::kOutY);
+    L.outH  = DPIScale(ui::kOutH);
+
+    L.chartTop = L.outY + L.outH + DPIScale(ui::kChartGapY);
+    L.chartW   = (std::max)(DPIScale(80),
+                            (L.clientW - 2 * mx - DPIScale(ui::kChartGapX)) / 2);
+    L.chartX1  = mx;
+    L.chartX2  = mx + L.chartW + DPIScale(ui::kChartGapX);
+
+    // 行高: 客户区给 4 行图表剩多少。够高就平分 (等价 Apple 那边"填满容器"的行为),
+    // 不够就退回最小行高, 内容溢出客户区 → 由滚动条兜住。
+    const int gapsY = (ui::kChartRows - 1) * DPIScale(ui::kChartGapY);
+    const int avail = L.clientH - L.chartTop - DPIScale(ui::kMarginBottom) - gapsY;
+    L.chartRowH = (std::max)(DPIScale(ui::kChartMinRowH), avail / ui::kChartRows);
+
+    L.contentH = L.chartTop + ui::kChartRows * L.chartRowH + gapsY + DPIScale(ui::kMarginBottom);
+    // 平分时的整除误差会让 contentH 比 clientH 少几像素, 那样 WM_PAINT 会 BitBlt 到
+    // 位图外边; 这里抬平到至少等于客户区高。
+    if (L.contentH < L.clientH) L.contentH = L.clientH;
+    return L;
+}
+
+// 按当前 g_scrollY 摆放全部子控件。子控件跟随内容一起滚动 (与 Apple 版把配置行也放进
+// ScrollView 的行为一致), 所以统一加 -g_scrollY 的 Y 偏移。
+void LayoutChildren(HWND hwnd, const Layout& L) {
+    (void)hwnd;                          // 摆位只用子窗口句柄, 父句柄留着保持接口对称
+    if (!hCharEdit) return;              // WM_CREATE 还没建完控件
+    const int mx = DPIScale(ui::kMarginX);
+    const int dy = -g_scrollY;
+    HDWP hdwp = BeginDeferWindowPos(8);  // 批量摆位, 减少缩放/滚动时的闪烁
+    auto put = [&](HWND h, int x, int y, int w, int hgt) {
+        if (!h) return;
+        if (hdwp) hdwp = DeferWindowPos(hdwp, h, NULL, x, y + dy, w, hgt,
+                                        SWP_NOZORDER | SWP_NOACTIVATE);
+        else      MoveWindow(h, x, y + dy, w, hgt, TRUE);   // DeferWindowPos 失败时的兜底
+    };
+    put(hHintLabel,    mx, DPIScale(ui::kHintY),
+        (std::max)(DPIScale(100), L.clientW - 2 * mx), DPIScale(ui::kLabelH));
+    for (int i = 0; i < 3; ++i) {
+        const int rowY = DPIScale(ui::kRowY0 + i * ui::kRowStep);
+        HWND lbl  = (i == 0) ? hCharLabel : (i == 1) ? hPoolMapLabel : hWepLabel;
+        HWND edit = (i == 0) ? hCharEdit  : (i == 1) ? hPoolMapEdit  : hWepEdit;
+        put(lbl,  mx,      rowY + DPIScale(ui::kLabelDY), DPIScale(ui::kLabelW), DPIScale(ui::kLabelH));
+        put(edit, L.editX, rowY,                          L.editW,               DPIScale(ui::kEditH));
+    }
+    put(hOutEdit, mx, L.outY, L.outW, L.outH);
+    if (hdwp) EndDeferWindowPos(hdwp);
+}
+
+void UpdateScrollInfo(HWND hwnd, const Layout& L) {
+    g_contentH = L.contentH;
+    SCROLLINFO si = { sizeof(si) };
+    // SIF_DISABLENOSCROLL: 内容装得下时把滚动条置灰而不是隐藏, 客户区宽度因此恒定,
+    // 不会触发 "设滚动条 → 客户区变窄 → WM_SIZE → 再设滚动条" 的重入。
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL;
+    si.nMin  = 0;
+    si.nMax  = L.contentH - 1;
+    si.nPage = (UINT)L.clientH;
+    si.nPos  = g_scrollY;
+    SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+    // 系统会按 range/page 夹紧 nPos, 读回来才是真实生效值
+    si.fMask = SIF_POS;
+    if (GetScrollInfo(hwnd, SB_VERT, &si)) g_scrollY = si.nPos;
+}
+
+// 滚动到指定位置。图表缓存按内容坐标系画好且与滚动无关, 所以这里【不】重建位图,
+// 只重新摆子控件 + 触发一次 WM_PAINT 换 BitBlt 源点 —— 滚动因此是廉价操作。
+void ScrollTo(HWND hwnd, int pos) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    const int maxPos = (std::max)(0, g_contentH - rc.bottom);
+    pos = (std::min)((std::max)(pos, 0), maxPos);
+    if (pos == g_scrollY) return;
+    g_scrollY = pos;
+    SCROLLINFO si = { sizeof(si) };
+    si.fMask = SIF_POS; si.nPos = g_scrollY;
+    SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+    LayoutChildren(hwnd, ComputeLayout(hwnd));
+    InvalidateRect(hwnd, NULL, FALSE);   // WM_ERASEBKGND 恒返回 1, 不需要擦除
+}
+
+void RebuildChartCache(HWND hwnd) {
+    const Layout L = ComputeLayout(hwnd);
+    // v0.1.4.0: 位图不再是"客户区大小", 而是【内容坐标系】的整幅高度 (contentH)。
+    //   滚动时只换 BitBlt 的源点 Y, 不必重画; 只有尺寸变化才需要重建。
+    //   代价是位图内存 = clientW × contentH × 4B (1260×1460 约 7MB; 4K 全屏下约 23MB),
+    //   对本工具可接受, 换来的是滚动完全不掉帧。
+    const int w = L.clientW, h = L.contentH;
     if (w <= 0 || h <= 0) return;
+    RECT rc = {0, 0, w, h};
 
     HDC hdcWnd = GetDC(hwnd);
     HDC hdcMem = CreateCompatibleDC(hdcWnd);
@@ -2709,22 +2864,20 @@ void RebuildChartCache(HWND hwnd) {
         Gdiplus::Graphics g(hdcMem);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
 
-        // 布局 (v0.1.4.0, 与 WM_CREATE 中的控件 Y 坐标保持同步):
-        //   header inputs   :   15 -  130
-        //   output text     :  135 -  415  (h=280, 比 v0.1.2.0 的 245 多 35 容纳重构寻访块)
-        //   char  row (蓝)  :  425 -  675  (h=250)
-        //   joint row (青)  :  680 -  930  (h=250)
-        //   refac row (紫)  :  935 - 1185  (h=250)   ← v0.1.4.0 新增: 重构寻访
-        //   wep   row (红)  : 1190 - 1440  (h=250)
-        //
-        // 四行均"图左 ECDF / 图右 MRL", 总宽 1240 (20 + 600 + 20 + 600 = 1240).
-        // 修改这里的 Y 时, WinMain 中窗口高度 1460 与 WM_CREATE 中 hOutEdit 的尺寸
-        // 也要同步, 三处必须一致, 否则要么 widget 溢出窗口要么底部出现空白带。
+        // 布局 (v0.1.4.0 起全部由 ComputeLayout() 从客户区尺寸算出, 不再写死坐标):
+        //   header inputs :  15 .. kOutY            (三行"标签 + 输入框", 输入框宽度跟随窗口)
+        //   output text   :  kOutY, 高 kOutH
+        //   四行图表      :  L.RowY(0..3), 每行 "左 ECDF / 右 MRL"
+        //     row0 特许寻访(蓝) / row1 辉光庆典(青) / row2 重构寻访(紫) / row3 武库申领(红)
+        //   每张图宽 = (客户区宽 - 两侧留白 - 中缝) / 2, 随窗口横向缩放;
+        //   行高 = 剩余高度四等分, 但不低于 kChartMinRowH, 低于就靠滚动条查看。
+        // 注意这里画的是【内容坐标系】(Y 不减 g_scrollY) —— 滚动发生在 WM_PAINT 的
+        // BitBlt 源点上, 见 WM_PAINT / ScrollTo。
 
         // ===== 角色池 (特许寻访) =====
         // 角色 ECDF: X 轴覆盖 UP 硬保底 120 (UP 分布延伸到此)
         // v0.1.1 起新增 UP 理论 CDF (g_cdf_char_up): 双状态前向迭代算法
-        DrawECDF  (g, Gdiplus::Rect(DPIScale(20),  DPIScale(425), DPIScale(600), DPIScale(250)),
+        DrawECDF  (g, Gdiplus::Rect(L.chartX1, L.RowY(0), L.chartW, L.chartRowH),
                    statsChar.freq_all, statsChar.freq_up,
                    statsChar.count_all, statsChar.count_up,
                    statsChar.censored_pity_all, statsChar.censored_pity_up,
@@ -2732,7 +2885,7 @@ void RebuildChartCache(HWND hwnd) {
                    L"角色 (特许寻访) 累积分布 (ECDF)", 120,
                    /*ecdf_up_step_size=*/1);
         // 角色 MRL: X=80 是综合 6 星硬保底 (理论 MRL 上限), X=120 是 UP 硬保底
-        DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(425), DPIScale(600), DPIScale(250)),
+        DrawMRL   (g, Gdiplus::Rect(L.chartX2, L.RowY(0), L.chartW, L.chartRowH),
                    statsChar.freq_all, statsChar.freq_up,
                    statsChar.count_all, statsChar.count_up,
                    statsChar.censored_pity_all, statsChar.censored_pity_up,
@@ -2757,14 +2910,14 @@ void RebuildChartCache(HWND hwnd) {
         //   MRL 计算用解析长尾延伸 (g_joint_tail_mean_excess), 把 CDF 在 240 之后的
         //   ~7% 长尾质量用单点近似补回, 让 MRL[0] 从无延伸的 ~82 修正回真值 ~104.68.
         //   drawTheoryCDF 仍画到数组末端 (cdf[240]≈0.93), ECDF 视觉上诚实显示截断.
-        DrawECDF  (g, Gdiplus::Rect(DPIScale(20),  DPIScale(680), DPIScale(600), DPIScale(250)),
+        DrawECDF  (g, Gdiplus::Rect(L.chartX1, L.RowY(1), L.chartW, L.chartRowH),
                    statsJoint.freq_all, statsJoint.freq_up,
                    statsJoint.count_all, statsJoint.count_up,
                    statsJoint.censored_pity_all, statsJoint.censored_pity_up,
                    g_cdf_char, g_cdf_joint_up,
                    L"角色 (辉光庆典) 累积分布 (ECDF)", 240,
                    /*ecdf_up_step_size=*/1);
-        DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(680), DPIScale(600), DPIScale(250)),
+        DrawMRL   (g, Gdiplus::Rect(L.chartX2, L.RowY(1), L.chartW, L.chartRowH),
                    statsJoint.freq_all, statsJoint.freq_up,
                    statsJoint.count_all, statsJoint.count_up,
                    statsJoint.censored_pity_all, statsJoint.censored_pity_up,
@@ -2783,14 +2936,14 @@ void RebuildChartCache(HWND hwnd) {
         //   E[首六星] ≈ 51.37 (特许 51.81), E[首 UP] ≈ 77.74 (特许 79.29) —— 多出的两次
         //   赠送十连让两个期望都略微下降。
         // X 轴与特许池一致取 120 (UP 硬保底), MRL 的理论上限同为 80 / 120。
-        DrawECDF  (g, Gdiplus::Rect(DPIScale(20),  DPIScale(935), DPIScale(600), DPIScale(250)),
+        DrawECDF  (g, Gdiplus::Rect(L.chartX1, L.RowY(2), L.chartW, L.chartRowH),
                    statsRefactor.freq_all, statsRefactor.freq_up,
                    statsRefactor.count_all, statsRefactor.count_up,
                    statsRefactor.censored_pity_all, statsRefactor.censored_pity_up,
                    g_cdf_refactor, g_cdf_refactor_up,
                    L"角色 (重构寻访) 累积分布 (ECDF)", 120,
                    /*ecdf_up_step_size=*/1);
-        DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(935), DPIScale(600), DPIScale(250)),
+        DrawMRL   (g, Gdiplus::Rect(L.chartX2, L.RowY(2), L.chartW, L.chartRowH),
                    statsRefactor.freq_all, statsRefactor.freq_up,
                    statsRefactor.count_all, statsRefactor.count_up,
                    statsRefactor.censored_pity_all, statsRefactor.censored_pity_up,
@@ -2802,7 +2955,7 @@ void RebuildChartCache(HWND hwnd) {
         // 武器 ECDF: X 轴覆盖 UP 硬保底 80
         // v0.1.1 起新增 UP 理论 CDF (g_cdf_wep_up): 4×8 状态机
         // ECDF 用真阶梯 (拨内 CDF 平坦, 10 倍数处跳跃) 体现"10 抽一组"机制
-        DrawECDF  (g, Gdiplus::Rect(DPIScale(20),  DPIScale(1190), DPIScale(600), DPIScale(250)),
+        DrawECDF  (g, Gdiplus::Rect(L.chartX1, L.RowY(3), L.chartW, L.chartRowH),
                    statsWep.freq_all, statsWep.freq_up,
                    statsWep.count_all, statsWep.count_up,
                    statsWep.censored_pity_all, statsWep.censored_pity_up,
@@ -2810,7 +2963,7 @@ void RebuildChartCache(HWND hwnd) {
                    L"武器累积分布 (ECDF)", 80,
                    /*ecdf_up_step_size=*/10);
         // 武器 MRL: X=40 综合硬保底, X=80 UP 硬保底
-        DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(1190), DPIScale(600), DPIScale(250)),
+        DrawMRL   (g, Gdiplus::Rect(L.chartX2, L.RowY(3), L.chartW, L.chartRowH),
                    statsWep.freq_all, statsWep.freq_up,
                    statsWep.count_all, statsWep.count_up,
                    statsWep.censored_pity_all, statsWep.censored_pity_up,
@@ -2832,7 +2985,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         hFont = CreateFontW(-DPIScale(13), 0, 0, 0, FW_NORMAL, 0, 0, 0,
                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
-        HWND hL1 = CreateWindowW(L"STATIC",
+        hHintLabel = CreateWindowW(L"STATIC",
             L"支持\x201C限定角色卡池:当期UP角色\x201D映射。未包含的限定角色卡池将仅排查常驻六星角色名单。",
             WS_CHILD | WS_VISIBLE,
             DPIScale(20), DPIScale(15), DPIScale(1000), DPIScale(20), hwnd, NULL, NULL, NULL);
@@ -2841,14 +2994,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // 3次「特许寻访」结束后, 移出「特许寻访」全部可能出现的干员列表。移出后, 概率提升的
         // 6星干员不会进入「基础寻访」。」即终末地【没有】限定角色下放常驻的机制。
         // 数据源: 客户端 GachaCharPoolContentTable 的 standard / beginner 两池六星恒为这 5 人。
-        HWND hL_Char = CreateWindowW(L"STATIC", L"常驻六星角色:",
+        hCharLabel = CreateWindowW(L"STATIC", L"常驻六星角色:",
             WS_CHILD | WS_VISIBLE,
             DPIScale(20), DPIScale(45), DPIScale(95), DPIScale(20), hwnd, NULL, NULL, NULL);
         hCharEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W",
             L"骏卫,黎风,别礼,余烬,艾尔黛拉",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             DPIScale(120), DPIScale(40), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
-        HWND hL_PoolMap = CreateWindowW(L"STATIC", L"当期UP角色:",
+        hPoolMapLabel = CreateWindowW(L"STATIC", L"当期UP角色:",
             WS_CHILD | WS_VISIBLE,
             DPIScale(20), DPIScale(75), DPIScale(95), DPIScale(20), hwnd, NULL, NULL, NULL);
         // 「卡池名 : 当期UP角色」映射。这份映射【必须补全】, 因为特许寻访池里的六星
@@ -2867,7 +3020,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             L"熔火灼痕:莱万汀,轻飘飘的信使:洁尔佩塔,热烈色彩:伊冯,河流的女儿:汤汤,狼珀:洛茜,春雷动，万物生:庄方宜,拳出无悔:弭弗,逐罪者:卡缪,临渊望北:诀,晨星于此闪耀:梨诺,冬猎:提弗洛斯,绚丽异彩:伊冯",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             DPIScale(120), DPIScale(70), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
-        HWND hL_Wep = CreateWindowW(L"STATIC", L"常驻六星武器:",
+        hWepLabel = CreateWindowW(L"STATIC", L"常驻六星武器:",
             WS_CHILD | WS_VISIBLE,
             DPIScale(20), DPIScale(105), DPIScale(95), DPIScale(20), hwnd, NULL, NULL, NULL);
         // 这份名单的语义是【已知的"非当期 UP"六星武器白名单】: 武器池的 Calculate() 传的
@@ -2914,9 +3067,76 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SendMessage(hOutEdit, EM_SETTABSTOPS, 1, (LPARAM)tabStops);
         SendMessage(hOutEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)GetSysColor(COLOR_3DFACE));
 
-        for (HWND h : {hL1, hL_Char, hCharEdit, hL_PoolMap, hPoolMapEdit, hL_Wep, hWepEdit, hOutEdit})
+        for (HWND h : {hHintLabel, hCharLabel, hCharEdit, hPoolMapLabel, hPoolMapEdit,
+                       hWepLabel, hWepEdit, hOutEdit})
             SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        // v0.1.4.0: 上面 CreateWindow 里那些坐标只是占位 —— 真正的位置一律由
+        //   LayoutChildren() 按当前客户区尺寸决定, 窗口每次缩放/滚动都会重算。
+        {
+            const Layout L = ComputeLayout(hwnd);
+            UpdateScrollInfo(hwnd, L);
+            LayoutChildren(hwnd, L);
+        }
         RebuildChartCache(hwnd);
+        break;
+    }
+    // v0.1.4.0: 窗口可缩放后, 尺寸一变就要重排控件 + 按新宽高重画图表。
+    //   图表行高/宽度都与客户区尺寸相关, 所以这里必须重建位图, 不能只 Invalidate。
+    //   重建 = 8 张 GDI+ 图重画, 拖动边框时每帧都会跑一次; 实测若觉得卡, 可以改成
+    //   WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE 期间只重排控件、松手后再重建图表。
+    case WM_SIZE: {
+        if (wParam == SIZE_MINIMIZED) break;      // 最小化时客户区为 0, 没必要折腾
+        const Layout L = ComputeLayout(hwnd);
+        if (L.clientW <= 0 || L.clientH <= 0) break;
+        // WM_SIZE 会以【相同尺寸】重复到达 (例如 SetScrollInfo 改变滚动条状态之后),
+        // 尺寸没变就没必要重画 8 张图。
+        static int s_lastW = -1, s_lastH = -1;
+        const bool sizeChanged = (L.clientW != s_lastW || L.clientH != s_lastH);
+        s_lastW = L.clientW; s_lastH = L.clientH;
+
+        const int maxScroll = (std::max)(0, L.contentH - L.clientH);
+        if (g_scrollY > maxScroll) g_scrollY = maxScroll;   // 窗口变高时把内容拉回来
+        UpdateScrollInfo(hwnd, L);
+        LayoutChildren(hwnd, L);
+        if (sizeChanged) RebuildChartCache(hwnd);
+        InvalidateRect(hwnd, NULL, FALSE);
+        break;
+    }
+    // 限制最小尺寸: 再小图表就没有可读性了, 且极端窄高会让布局退化。
+    // g_dpi 在 CreateWindowW 之前就已设置好, 这里可以安全使用。
+    case WM_GETMINMAXINFO: {
+        auto* mmi = (MINMAXINFO*)lParam;
+        mmi->ptMinTrackSize.x = DPIScale(ui::kMinWindowW);
+        mmi->ptMinTrackSize.y = DPIScale(ui::kMinWindowH);
+        break;
+    }
+    case WM_VSCROLL: {
+        SCROLLINFO si = { sizeof(si) };
+        si.fMask = SIF_ALL;
+        if (!GetScrollInfo(hwnd, SB_VERT, &si)) break;
+        int pos = si.nPos;
+        const int line = DPIScale(ui::kScrollLine);
+        switch (LOWORD(wParam)) {
+        case SB_TOP:           pos  = si.nMin;          break;
+        case SB_BOTTOM:        pos  = si.nMax;          break;
+        case SB_LINEUP:        pos -= line;             break;
+        case SB_LINEDOWN:      pos += line;             break;
+        case SB_PAGEUP:        pos -= (int)si.nPage;    break;
+        case SB_PAGEDOWN:      pos += (int)si.nPage;    break;
+        // THUMBTRACK 用 nTrackPos 才能跟手 (nPos 在拖动过程中不更新)
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION: pos  = si.nTrackPos;     break;
+        default: break;
+        }
+        ScrollTo(hwnd, pos);
+        break;
+    }
+    // 滚轮: 一格滚三"行"。注意鼠标停在输出文本框上时消息会先给那个 RichEdit
+    // (它自带 WS_VSCROLL), 由它滚自己的内容 —— 与 Apple 版嵌套 ScrollView 行为一致。
+    case WM_MOUSEWHEEL: {
+        const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        ScrollTo(hwnd, g_scrollY - delta * DPIScale(ui::kScrollLine) * 3 / WHEEL_DELTA);
         break;
     }
     case WM_DROPFILES: {
@@ -2941,10 +3161,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_hChartBmp) {
             HDC hdcMem = CreateCompatibleDC(hdc);
             HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, g_hChartBmp);
+            // v0.1.4.0: 位图是内容坐标系的整幅图, 这里按当前滚动量偏移源点 Y 取一片。
+            //   滚动之所以廉价就在于此 —— 只是换个源点, 不重画任何图表。
             BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top,
                    ps.rcPaint.right - ps.rcPaint.left,
                    ps.rcPaint.bottom - ps.rcPaint.top,
-                   hdcMem, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+                   hdcMem, ps.rcPaint.left, ps.rcPaint.top + g_scrollY, SRCCOPY);
             SelectObject(hdcMem, hOld);
             DeleteDC(hdcMem);
         }
@@ -3010,19 +3232,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     wc.lpszClassName = L"EndfieldStatsClass";
     RegisterClassW(&wc);
 
-    DWORD dwStyle = (WS_OVERLAPPEDWINDOW ^ WS_THICKFRAME ^ WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
-    // 窗口尺寸:
-    //   高度 (v0.1.2.0): 900 → 1170, 容纳新增的辉光庆典图表行 (245 顶部空间 + 250 新图表 - 5 边距吸收)
-    //   高度 (v0.1.4.0): 1170 → 1460, 容纳新增的重构寻访图表行 (+250) 与加高的输出框 (245→280, +35),
-    //                   底部留白仍为 20 (最后一行图表底边 y=1440)。
-    //                   ⚠ 1460 (在 100% DPI 下) 已经高于 1080p 屏的可用高度; 本程序窗口不可
-    //                   缩放也没有滚动条 (WS_THICKFRAME/WS_MAXIMIZEBOX 都被去掉了), 在
-    //                   1080p 上会看不到最底部的武器行。若要兼顾小屏, 后续需要给主窗口加
-    //                   垂直滚动 (WS_VSCROLL + WM_VSCROLL, WM_PAINT 时按滚动量偏移 BitBlt 源点),
-    //                   或把每行图表高度从 250 压到 ~200。
+    // v0.1.4.0: 窗口改为【可缩放 + 可最大化 + 带垂直滚动条】。
+    //   此前为了保证图表布局不被破坏, 特意去掉了 WS_THICKFRAME / WS_MAXIMIZEBOX,
+    //   代价是窗口高度必须能装下全部内容 —— 加入第 4 行图表 (重构寻访) 后需要 1460px,
+    //   在 1080p 屏上底部会被截掉且无法滚动查看。
+    //   现在坐标全部由 ComputeLayout() 动态算出, 缩放安全; 装不下就滚动 (参考 Apple 版
+    //   macOS ContentView 把主区域套进 ScrollView 的做法)。
+    DWORD dwStyle = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VSCROLL;
+    // 初始窗口尺寸 (之后用户可以随意拖动):
     //   宽度 (v0.1.2.4): 1280 → 1260, 让左右留白对称 (内容右边界 x=1240, 左留白 20 → 右留白也 20).
-    //                   之前 1280 时右留白 40, 比左留白 20 多 20px, 视觉不平衡.
-    RECT rect = {0, 0, DPIScale(1260), DPIScale(1460)};
+    //   高度: 取 4 行图表都不压缩时的完整内容高 (1460), 但不超过工作区高度的 92% ——
+    //         这样 1440p/4K 上开箱即见全部内容, 1080p 上则自动开成能放下的高度,
+    //         底部内容用滚动条查看, 不会一启动就有一半在屏幕外。
+    RECT wa = {0};
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0)) {
+        wa.right = GetSystemMetrics(SM_CXSCREEN);
+        wa.bottom = GetSystemMetrics(SM_CYSCREEN);
+    }
+    const int waH = (std::max)(DPIScale(ui::kMinWindowH), (int)((wa.bottom - wa.top) * 92 / 100));
+    RECT rect = {0, 0, DPIScale(1260), (std::min)(DPIScale(1460), waH)};
     AdjustWindowRectEx(&rect, dwStyle, FALSE, 0);
 
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"终末地抽卡记录分析与可视化",

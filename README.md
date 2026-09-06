@@ -35,6 +35,18 @@ Gacha tracker and visualizer for Arknights: Endfield. Built with C++20 &amp; Win
 
 
 
+## Window 窗口
+The window is resizable and maximizable. Charts scale with the window width, and the four chart rows
+share the remaining height (growing on tall displays). When the content does not fit — on a 1080p
+screen, for example — a vertical scrollbar appears. This mirrors the Apple version, whose macOS view
+wraps the whole content in a `ScrollView`.
+
+窗口可自由缩放与最大化。图表宽度跟随窗口，四行图表平分剩余高度（屏幕越高图表越大）；内容放不下时
+（例如 1080p 屏）会出现垂直滚动条。该行为与 Apple 版一致 —— 其 macOS 界面同样把整个内容区套在
+`ScrollView` 中。
+
+
+
 ## Compatibility 兼容性
 ### Windows
 - **System 系统**: Windows 10 or higher (视窗 10 或更高版本)
