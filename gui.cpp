@@ -33,7 +33,7 @@
 // ---------------------------------------------------------
 enum class ItemType  : uint8_t { Unknown = 0, Character, Weapon };
 enum class RankType  : uint8_t { Unknown = 0, Rank3 = 3, Rank4 = 4, Rank5 = 5, Rank6 = 6 };
-enum class GachaType : uint8_t { Unknown = 0, Beginner, Standard, Special, Constant, Joint };
+enum class GachaType : uint8_t { Unknown = 0, Beginner, Standard, Special, Constant, Joint, Refactor };
 
 // 无堆分配的大小写不敏感包含比较
 // 原版每次解析一条记录都要 std::string + reserve + push_back + find, 这是严重的 hot-path bug
@@ -84,6 +84,15 @@ inline GachaType ParseGachaType(std::string_view sv) {
     // 注意先匹配 Joint 再匹配 Standard, 避免 "Joint"/"Constant" 等子串误判
     // (这里实际没有冲突,纯粹是命中率优化:UIGF v4.2 里 gacha_type 值的精确字符串
     // 是 "E_CharacterGachaPoolType_Joint" 等, ContainsCI 检查 "joint" 即可)
+    //
+    // Refactor 池 (重构寻访, 1.5「雪凇幽梦」新增, 客户端 GachaCharPoolTypeTable type=4):
+    //   poolId 形如 "rerun_chr_yvonne" (角色) / "rerun_wpn_yvonne" (武器),
+    //   /api/record/char 的 pool_type 枚举为 E_CharacterGachaPoolType_Rerun
+    //   —— 该枚举已向官方接口实测确认 (见 main.cpp 中 pools 表的说明), 不是猜测。
+    //   本导出器把 poolId 写进 UIGF 的 gacha_type, 故这里匹配 "rerun";
+    //   同时兼容其它工具可能写入的 "refactor" 拼法。
+    if (ContainsCI(sv, "rerun"))    return GachaType::Refactor;
+    if (ContainsCI(sv, "refactor")) return GachaType::Refactor;
     if (ContainsCI(sv, "joint"))    return GachaType::Joint;
     if (ContainsCI(sv, "special"))  return GachaType::Special;
     if (ContainsCI(sv, "beginner")) return GachaType::Beginner;
@@ -353,13 +362,19 @@ struct StatsResult {
     std::array<double, 260> hazard_all{}, hazard_up{};
     double ks_d_all = 0.0, ks_d_up = 0.0;
     bool ks_is_normal = true, ks_is_normal_up = true;
+    // v0.1.4.0: UP 侧样本是否为"两种分布的混合", 混合时不输出拟合判定 (见 Calculate)
+    bool ks_up_mixed = false;
     // 右删失(用于显示"当前已垫 N 抽")
     int censored_pity_all = 0;
     int censored_pity_up  = 0;
 };
 
-StatsResult statsChar, statsWep, statsJoint;
+StatsResult statsChar, statsWep, statsJoint, statsRefactor;
 HWND hOutEdit, hCharEdit, hWepEdit, hPoolMapEdit;
+// v0.1.4.0: 三个说明标签也提成全局 —— 窗口可缩放后每次 WM_SIZE / 滚动都要重新摆位
+HWND hHintLabel = NULL, hCharLabel = NULL, hPoolMapLabel = NULL, hWepLabel = NULL;
+static int g_scrollY  = 0;   // 当前垂直滚动量 (物理像素)
+static int g_contentH = 0;   // 最近一次布局算出的内容总高 (物理像素)
 static HBITMAP g_hChartBmp = NULL;
 int g_dpi = 96;
 int   DPIScale (int value)   { return MulDiv(value, g_dpi, 96); }
@@ -426,11 +441,18 @@ float DPIScaleF(float value) { return value * (g_dpi / 96.0f); }
 //     - 验证: cdf[240] + 长尾点质量 与 simulate 到 n=2000 精确 MRL 全程误差 < 1e-9 抽.
 //     - 历史: v0.1.2.3 用过 g_cdf_joint_up[1002] 物理扩到 1000 抽让 CDF 自然收敛到
 //             0.999993, 数学等价但浪费 ~8KB 静态内存, v0.1.2.4 改用解析延伸.
+// 角色寻访的基础六星概率 (客户端 GachaCharPoolTypeTable: star6BaseRate = 8000 → 0.8%)。
+// 赠送十连(加急招募)恒按【基础概率】判定, 不吃 66 抽起的软保底加成 —— 见下方各
+// 免费十连展开循环。
+constexpr double kBaseRate6 = 0.008;
+
 static double g_cdf_char[82]   = {};  // x=0..80,角色池综合
 static double g_cdf_wep[41]    = {};  // x=0..40,武器池综合
 static double g_cdf_char_up[122] = {};  // x=0..120, 角色池 UP
 static double g_cdf_wep_up[81]   = {};  // x=0..80,  武器池 UP
 static double g_cdf_joint_up[242] = {}; // x=0..240, 辉光庆典 限定 (首个非常驻六星)
+static double g_cdf_refactor[82]    = {};  // x=0..80,  重构寻访综合 (赠送十连节点在 30/60)
+static double g_cdf_refactor_up[122] = {}; // x=0..120, 重构寻访 UP (系列首次, 含 120 硬保底)
 // 辉光池 CDF 在 X=240 处仅 ~93%, 长尾用解析点质量延伸 (见 InitCDFTables 末尾):
 //   g_joint_tail_mean_excess = E[首限定抽数 | 首限定 > 240] - 240
 // 工程含义: 在 computeTheoryMRL 中, 对辉光池追加一项
@@ -568,7 +590,7 @@ void InitCDFTables() {
                     std::array<double, max_soft> newStateA{};
                     for (int s = 0; s < max_soft; ++s) {
                         if (stateA[s] == 0) continue;
-                        double ph = h_char(s + 1);
+                        const double ph = kBaseRate6;   // 赠送十连走基础概率, 不吃软保底加成
                         newStateA[s] += stateA[s] * (1.0 - ph);   // 不出货, 水位停
                         p_hit_grad   += stateA[s] * ph * 0.5;     // 毕业 (出 UP)
                         newStateA[s] += stateA[s] * ph * 0.5;     // 歪, 水位停 (isFree)
@@ -589,6 +611,142 @@ void InitCDFTables() {
 
             cum += p_hit_grad;
             g_cdf_char_up[n] = (std::min)(1.0, cum);
+            D = newD;
+        }
+    }
+
+    // ---- 重构寻访 综合六星 CDF (g_cdf_refactor[0..80]) ----
+    // 「重构寻访」(RE-Factor Headhunting) 是 1.5「雪凇幽梦」新增的第五种角色寻访类型,
+    // 首期「绚丽异彩」重构寻访#1 于 2026/09/24 12:00 开启 (UP = 伊冯, 旧限定复刻)。
+    //
+    // 数值来源 (客户端 GachaCharPoolTypeTable type=4, 与特许寻访 type=0 逐字段比对):
+    //   star6BaseRate            = 8000    → 0.8%      (与特许寻访相同)
+    //   star6RatePromotePullCount= [66]              ┐ 第 66 抽起每抽 +5%
+    //   star6RatePromoteValue    = [50000] → +5%     ┘ (与特许寻访相同)
+    //   softGuarantee            = 80      → 80 抽硬保底出六星  (与特许寻访相同)
+    //   hardGuarantee            = 120     → 120 抽必出 UP      (与特许寻访相同)
+    //   shareSoftGuarantee       = true
+    //   freeTenPullRewardPullCount = [30, 60, 90]  ← 【唯一的数值差异】
+    //     特许寻访是 [30, 0, 0] (只在累计 30 抽送 1 次免费十连),
+    //     重构寻访在累计 30 / 60 / 90 抽【各】送 1 次免费十连。
+    //   testimonialPullCount     = 0       → 重构寻访没有特许寻访的 60 抽「寻访情报书」
+    // 官方规则原文:《「雪凇幽梦」版本研发通讯》 https://endfield.hypergryph.com/news/4776
+    //   (英文版 https://endfield.gryphline.com/en-us/news/4481)
+    //
+    // 本表与 g_cdf_char 的唯一差别: 赠送十连的合并 hazard 节点从「只有 30」变成「30 和 60」。
+    // 为什么没有 90: 本表按【距上次六星的抽数 x】索引, 而 80 抽硬保底保证 x <= 80,
+    //   所以累计第 90 抽的那次赠送十连在本表的坐标系里不可达 (它只能发生在某次六星之后,
+    //   此时水位已经归零)。第 3 次赠送十连的贡献在经验侧被并入节点 60 (见 Calculate 中
+    //   free_node_all 的说明) —— 这是与既有 g_cdf_char 同一类的、已知且刻意的近似:
+    //   赠送十连绑定的是【本期累计抽数】而不是【水位】, 只有在该里程碑之前没出过六星时
+    //   两者才重合。
+    {
+        double surv_rf = 1.0;
+        for (int i = 1; i <= 80; ++i) {
+            double p;
+            if (i == 30 || i == 60) p = 1.0 - std::pow(1.0 - kBaseRate6, 11);  // 本体 1 抽 + 免费十连 10 抽
+            else if (i <= 65)       p = 0.008;
+            else if (i <= 79)       p = 0.058 + (i - 66) * 0.05;
+            else                    p = 1.0;
+            if (p > 1.0) p = 1.0;
+            g_cdf_refactor[i] = g_cdf_refactor[i - 1] + surv_rf * p;
+            surv_rf *= (1.0 - p);
+        }
+        g_cdf_refactor[81] = 1.0;
+    }
+
+    // ---- 重构寻访 UP 理论 CDF (g_cdf_refactor_up[0..120]) ----
+    // 与 g_cdf_char_up 同构 (单维水位状态 + 每次出货独立 50/50 + n=120 硬保底强制毕业),
+    // 唯一差别: 赠送十连展开点从 {30} 变成 {30, 60, 90}。
+    // 注意本表按【累计抽数 n】索引 (不是水位), 所以 30/60/90 三个里程碑都能【精确】表达,
+    // 不存在 g_cdf_refactor 那里的坐标系近似。
+    //
+    // 【重要假设 — 官方未公布】P(UP | 出六星) = 50%。
+    //   官方对重构寻访只说「6星干员【伊冯】获取概率大幅提升」, 没有给出 UP 占比数字;
+    //   客户端 GachaCharPoolContentTable 的角色条目也【没有】randomWeight 字段
+    //   (武器池才有, 武器侧因此能精确算出 20/(20+6*10) = 25%)。
+    //   这里沿用特许寻访的 50%, 依据是两池其余全部参数逐字段相同。
+    //   ★ 待 2026/09/24 开池后, 用游戏内【干员寻访】的概率公示页核对; 若不是 50%,
+    //     本表与下面 win_5050 的「理论 50%」标注都要跟着改。
+    //
+    // 【与特许寻访的机制差异 (来自 news/4776 官方原文), 对本表的影响】
+    //   - 80 抽小保底: 「所有『重构寻访』共享此项保底机制…该保底计数将继承到其他
+    //     『重构寻访』中」→ 跨期不清零 (Calculate 里 track_banner 对重构池取 false)。
+    //   - 120 抽 UP 保底: 「前120次寻访必定能获取概率提升的6星干员, 该规则在同名重构寻访中
+    //     【仅生效1次】。该计数将继承到后续的同名重构寻访中」→ 与特许寻访「每期独立重置」
+    //     不同, 它是【每个同名系列一生只触发一次】。
+    //     ⇒ 本表描述的是【该系列尚未用掉 120 兜底】时的分布 (即首次抽该系列)。
+    //       系列兜底一旦用掉, 后续复刻期的理论分布退化为「无 120 硬保底」的长尾形态
+    //       (形状接近 g_cdf_joint_up 而非本表)。截至目前「绚丽异彩」#1 是史上第一期
+    //       重构寻访, 任何真实数据都只可能处于「兜底未用掉」状态, 故只建首次曲线;
+    //       等 #2 复刻真正出现后再补第二条曲线。
+    {
+        constexpr int hard_cap = 120;
+        constexpr int max_soft = 80;
+        auto h_rf = [](int k) -> double {
+            if (k <= 65)      return 0.008;
+            else if (k <= 79) return 0.058 + (k - 66) * 0.05;
+            else              return 1.0;
+        };
+        std::array<double, max_soft> D{}; D[0] = 1.0;
+        double cum = 0.0;
+        for (int n = 1; n <= hard_cap; ++n) {
+            if (n == hard_cap) {
+                double alive = 0.0;
+                for (int s = 0; s < max_soft; ++s) alive += D[s];
+                cum += alive;
+                g_cdf_refactor_up[n] = (std::min)(1.0, cum);
+                for (int k = n + 1; k <= hard_cap + 1; ++k) g_cdf_refactor_up[k] = 1.0;
+                break;
+            }
+
+            std::array<double, max_soft> newD{};
+            double p_hit_grad = 0.0;
+
+            if (n == 30 || n == 60 || n == 90) {
+                // ===== 赠送十连里程碑: 11 次独立判定 (本体抽 1 次 + 免费十连 10 次) =====
+                // 免费十连不推进也不重置水位 (官方: 其结果不计入保底计数), 与 g_cdf_char_up
+                // 在 n=30 的处理完全一致, 这里只是把同一段逻辑用在三个里程碑上。
+                std::array<double, max_soft> stateA{};
+                for (int s = 0; s < max_soft; ++s) {
+                    if (D[s] == 0) continue;
+                    double ph = h_rf(s + 1);
+                    if (s + 1 < max_soft) stateA[s + 1] += D[s] * (1.0 - ph);
+                    p_hit_grad += D[s] * ph * 0.5;   // 毕业 (出 UP)
+                    stateA[0]  += D[s] * ph * 0.5;   // 歪, 水位归 0 (本体抽), 仍未出 UP
+                }
+                for (int free_step = 0; free_step < 10; ++free_step) {
+                    std::array<double, max_soft> newStateA{};
+                    for (int s = 0; s < max_soft; ++s) {
+                        if (stateA[s] == 0) continue;
+                        // 赠送十连走【基础概率】, 不吃软保底加成 —— 官方对加急招募的原文是
+                        // 「加急招募的干员获取概率与本次寻访的基础概率一致」, 且其结果不计入
+                        // 保底计数。故这里必须用 kBaseRate6 而不是 h_rf(s+1)。
+                        //
+                        // 为什么特许/辉光池没暴露这个问题: 它们只有 n=30 一个赠送节点, 那时
+                        // 水位 s <= 30 < 66, h() 本来就等于基础概率, 两种写法数值相同。
+                        // 重构池的第 3 个节点在 n=90, 存活水位可以到 66..79 的软保底段 ——
+                        // 若沿用 h_rf, 免费单抽会被算成最高 30.8% 的出货率 (基础是 0.8%)。
+                        const double ph = kBaseRate6;
+                        newStateA[s] += stateA[s] * (1.0 - ph);   // 不出货, 水位停
+                        p_hit_grad   += stateA[s] * ph * 0.5;     // 毕业 (出 UP)
+                        newStateA[s] += stateA[s] * ph * 0.5;     // 歪, 水位停 (isFree)
+                    }
+                    stateA = newStateA;
+                }
+                newD = stateA;
+            } else {
+                for (int s = 0; s < max_soft; ++s) {
+                    if (D[s] == 0) continue;
+                    double ph = h_rf(s + 1);
+                    if (s + 1 < max_soft) newD[s + 1] += D[s] * (1.0 - ph);
+                    p_hit_grad += D[s] * ph * 0.5;
+                    newD[0]    += D[s] * ph * 0.5;
+                }
+            }
+
+            cum += p_hit_grad;
+            g_cdf_refactor_up[n] = (std::min)(1.0, cum);
             D = newD;
         }
     }
@@ -709,7 +867,7 @@ void InitCDFTables() {
                     std::array<double, max_soft> newStateA{};
                     for (int s = 0; s < max_soft; ++s) {
                         if (stateA[s] == 0) continue;
-                        double ph = h_char(s + 1);
+                        const double ph = kBaseRate6;   // 赠送十连走基础概率, 不吃软保底加成
                         newStateA[s] += stateA[s] * (1.0 - ph);          // 不出货, 水位停
                         p_hit_grad   += stateA[s] * ph * 0.5;            // 毕业
                         newStateA[s] += stateA[s] * ph * 0.5;            // 非限定, 水位停 (isFree)
@@ -785,7 +943,7 @@ void InitCDFTables() {
                         std::array<double, max_soft> newStateA{};
                         for (int s = 0; s < max_soft; ++s) {
                             if (stateA[s] == 0) continue;
-                            double ph = h_char(s + 1);
+                            const double ph = kBaseRate6;   // 同上: 赠送十连走基础概率
                             newStateA[s] += stateA[s] * (1.0 - ph);
                             p_hit_grad   += stateA[s] * ph * 0.5;
                             newStateA[s] += stateA[s] * ph * 0.5;
@@ -955,11 +1113,22 @@ inline double SampleVariance(long long sum, long long sum_sq, int n) {
 //            (辉光庆典池没有"当期 UP"概念, 所有非常驻 6 星都算 UP)
 //   - false: 走原 pool_map 优先 → standard_names 兜底的路径
 //   - 武器池 (isWeapon=true) 忽略 isJoint
+//
+// isRefactor 参数 (v0.1.4.0 新增, 重构寻访 RE-Factor):
+//   - 池中六星 = 当期 UP + 5 名常驻 (无往期限定滞留), 所以 pool_map 与常驻排除法
+//     两条路径都能正确判 UP; 与 Special 一样走 pool_map 优先。
+//   - 80 抽小保底【所有重构寻访之间共享继承】→ current_pity 全局共享, 不按期重置
+//     (track_banner = false)
+//   - 120 抽 UP 保底 / 累计奖励 / 未使用的加急招募【只在同名系列内继承, 且兜底一生仅
+//     生效 1 次】→ 这三样按 pool_name 存进 series_states, 离开某系列再回来能接上进度。
+//     不能用"换池就清零"来近似: 那样 A→B→A 时 A 的进度会丢 (见 series_states 处说明)。
+//   - 赠送十连有 3 处 (累计 30/60/90 抽), 而非特许寻访的 1 处; 计数同样按系列独立
+//   官方规则原文: https://endfield.hypergryph.com/news/4776
 // -------------------------------------------------------
 StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
                      const std::unordered_set<std::string, StringHash, std::equal_to<>>& standard_names,
                      const std::unordered_map<std::string, std::string, StringHash, std::equal_to<>>& pool_map,
-                     bool isJoint = false) {
+                     bool isJoint = false, bool isRefactor = false) {
     StatsAccumulator acc;
     int current_pity = 0, pity_since_last_up = 0;
     // 卡池边界重置策略 (终末地三池各不同 —— 联网核实 + uigf 数据验证):
@@ -971,10 +1140,46 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     // 三池均无“歪→下次必中”那种保底; 边界用 poolName 变化探测 (数据里每期 pool_name 唯一;
     //   武器 id 为负, 桶内按 |id| 升序 = 时间序, 每期连续).
     bool got_up_banner = false;
-    const bool track_special = (!isWeapon && !isJoint);
+    // 重构寻访: 80 小保底跨所有重构池共享继承, 120 UP 保底按【同名系列】一生一次,
+    //   两者都不按期重置 → 与 Joint 一样 track_banner = false;
+    //   但它【有】120 硬保底 (Joint 没有), 所以 forced_by_hardpity 要单独放行, 见下。
+    const bool track_special = (!isWeapon && !isJoint && !isRefactor);
     const bool track_weapon  = isWeapon;
-    const bool track_banner  = (track_special || track_weapon);   // Joint 不按期重置
+    const bool track_banner  = (track_special || track_weapon);   // Joint / Refactor 不按期重置
     const int  hardpity_n    = isWeapon ? 71 : 120;
+
+    // 赠送十连块计数 (v0.1.4.0): 重构寻访在累计 30/60/90 抽各送 1 次免费十连,
+    //   需要把每个 isFree 块映射到对应的里程碑节点, 否则三个块会全部挤在节点 30,
+    //   与理论 CDF 对不上。特许/辉光只有 1 处赠送十连, 恒为节点 30, 不受影响。
+    //
+    //   计法: 直接数【本桶内累计的 isFree 记录条数】, 第 n 条属于第 (n/10) 块 (0-based)。
+    //   不能靠"非 isFree → isFree 的跳变"来分块 —— 官方允许把未使用的加急招募留到后面
+    //   (「未使用的加急招募, 将保留到后续同名重构寻访中」), 玩家完全可能攒够 90 抽后
+    //   连着开三次十连, 记录里就是连续 30 条 is_free=true, 跳变法只会数出 1 块。
+    //
+    //   已知局限: 抽卡记录只保留最近 90 天, 历史被截断时第一块可能只剩半截, 会让后续
+    //   块序号整体偏移。无法从记录本身分辨, 故不做补偿 —— 影响仅限赠送出货落在哪个
+    //   理论节点, 不影响出货计数与胜负统计。
+    int free_pull_count = 0;                       // 非重构池用 (恒为节点 30, 实际不参与计算)
+
+    // 重构寻访的【按系列保存】状态 (v0.1.4.0)。
+    //   官方两个作用域不同:
+    //     - 80 抽六星保底: 「所有『重构寻访』共享」→ current_pity 全局共享, 不进本表
+    //     - 120 抽首个 UP 保底 / 累计奖励 / 未使用的加急招募:
+    //       「在【同名】重构寻访中仅生效 1 次 / 将保留到后续【同名】重构寻访中」
+    //       → 每个系列各自一份, 离开再回来要能接上
+    //   早先的写法是"pool_name 变了就把 UP 侧清零", 那只能处理 A→B, 处理不了
+    //   A→B→A: 回到 A 时 A 的进度已经被抹掉, 会把本该是第 120 抽的首个 UP 记成第 60 抽,
+    //   也会把已经用掉的兜底额度错误地"还"给 A。而且这【不需要两个系列同时开放】,
+    //   依次经历 A 第一期 → B 第一期 → A 第二期就会发生。
+    //   系列标识用 pool_name: 同名系列的 #1/#2/#3 共用一个 pool_name, 不同系列名字不同。
+    struct SeriesState {
+        int  pity_up    = 0;      // 距该系列上一个 UP 的抽数 (即 120 兜底的计数)
+        int  free_count = 0;      // 该系列已用掉的赠送十连条数 (决定 30/60/90 节点)
+        bool got_up     = false;  // 该系列的 120 兜底额度是否已被本体抽消耗
+    };
+    std::unordered_map<std::string_view, SeriesState> series_states;
+    SeriesState* last_series = nullptr;   // 收尾算右删失时用最后活动的那个系列
 
     // 第30抽赠送十连处理 (依据《明日方舟终末地抽卡机制解析》2.1.1):
     //   - "该十连享有基础概率(0.008),但不占用也不增加保底进度"
@@ -988,10 +1193,29 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     for (size_t i = 0; i < total; ++i) {
         const bool isFree = bucket.is_free[i];
 
+        // 重构池: 按 pool_name 取出该系列自己的状态 (不存在则默认构造 = 全新系列)。
+        //   unordered_map 是节点式容器, 插入新键不会让已取得的引用失效。
+        //   非重构池仍用函数级的单份状态, 行为与既有版本完全一致。
+        SeriesState* ss = nullptr;
+        if (isRefactor) {
+            ss = &series_states[bucket.poolNames[i]];
+            last_series = ss;
+        }
+        int&  up_pity   = isRefactor ? ss->pity_up    : pity_since_last_up;
+        bool& up_gotten = isRefactor ? ss->got_up     : got_up_banner;
+        int&  free_cnt  = isRefactor ? ss->free_count : free_pull_count;
+
+        // 本条若是赠送十连, 先算出它属于第几块 (1-based), 再累加计数
+        int free_block_idx = 0;
+        if (isFree) free_block_idx = (free_cnt++ / 10) + 1;
+
         // 卡池边界探测: 读分桶阶段预计算的字节标记 (v0.1.3.2), 不再在热路径 memcmp 池名。
         //   starts_new_banner[i] = (本条 poolName 与上一条不同); 首条恒为 0 → 已含原 i>0 守卫。
         //   特许池: 120 硬保底不继承 → pity_since_last_up + got_up_banner 清零; 80 小保底继承 (current_pity 不动)
         //   武器池: 40 + 80 都不继承 → current_pity + pity_since_last_up + got_up_banner 全清零
+        // 重构池【不】走这里: 它的 UP 侧状态按系列存在 series_states 里, 换池只是换一份
+        //   状态, 不需要清零; current_pity 则跨所有重构池共享, 更不能清。
+        //   这样两个系列即使记录交错 (将来两个重构系列同时开放), 各自的计数也互不干扰。
         if (track_banner && bucket.starts_new_banner[i]) {
             pity_since_last_up = 0;
             got_up_banner      = false;
@@ -1001,7 +1225,7 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         // 赠送十连不推进保底通道
         if (!isFree) {
             ++current_pity;
-            ++pity_since_last_up;
+            ++up_pity;
         }
 
         // 非六星:likely 分支
@@ -1010,9 +1234,22 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         }
 
         // 出 6 星. 决定计入 freq 的位置:
-        //   - 赠送十连出货 -> 归入 freq[30]
-        //   - 正常出货 -> 归入 freq[current_pity]
-        const int slot_all = isFree ? 30 : current_pity;
+        //   - 赠送十连出货 -> 归入对应里程碑节点 (特许/辉光恒为 30; 重构为 30/60/90)
+        //   - 正常出货     -> 归入 freq[current_pity]
+        //
+        // 重构寻访的两套坐标系 (v0.1.4.0):
+        //   free_node_up  用于 freq_up —— g_cdf_refactor_up 按【累计抽数】索引, 30/60/90
+        //                  三个里程碑都能精确表达, 直接按块序号映射。
+        //   free_node_all 用于 freq_all —— g_cdf_refactor 按【距上次六星的水位】索引,
+        //                  而 80 抽硬保底保证水位 <= 80, 累计第 90 抽的赠送十连在该坐标系
+        //                  里不可达, 故第 3 块及以后并入节点 60。这是与既有 g_cdf_char
+        //                  同一类的已知近似 (赠送十连绑定累计抽数而非水位), 见 InitCDFTables。
+        int free_node_all = 30, free_node_up = 30;
+        if (isRefactor && free_block_idx >= 2) {
+            free_node_all = 60;
+            free_node_up  = (free_block_idx == 2) ? 60 : 90;
+        }
+        const int slot_all = isFree ? free_node_all : current_pity;
         if (slot_all < 260) acc.freq_all[slot_all]++;
         if (slot_all > acc.max_pity_all) acc.max_pity_all = slot_all;
         acc.count_all++;
@@ -1031,7 +1268,7 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         }
 
         if (isUP) {
-            const int slot_up = isFree ? 30 : pity_since_last_up;
+            const int slot_up = isFree ? free_node_up : up_pity;
             if (slot_up < 260) acc.freq_up[slot_up]++;
             if (slot_up > acc.max_pity_up) acc.max_pity_up = slot_up;
             acc.count_up++;
@@ -1045,10 +1282,14 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
             //     角色 120 抽硬保底; 武器 8 申领(第 71..80 抽)硬保底, 见 hardpity_n。
             //   - 辉光庆典: 无硬保底, 每个限定直接计入。
             //   - avg_win (count_win/sum_win) 仅特许池有物理含义; 武器/Joint 不累计 (avg_win 保持 -1)。
+            // 重构寻访虽然 track_banner=false (不按期重置), 但它【有】120 抽硬保底,
+            // 只是作用域是"同名系列一生一次" —— up_gotten 对重构池取的是【该系列】的
+            // 状态且永不清零, 恰好等价于该语义, 故这里把 isRefactor 一并放行。
             const bool forced_by_hardpity =
-                track_banner && !got_up_banner && !isFree && pity_since_last_up >= hardpity_n;
+                (track_banner || isRefactor) && !up_gotten && !isFree &&
+                up_pity >= hardpity_n;
             if (isJoint) {
-                acc.win_5050++;
+                acc.win_5050++;                 // 辉光庆典无硬保底, 每个限定都是掷硬币结果
             } else if (!forced_by_hardpity) {
                 acc.win_5050++;
                 if (!isWeapon) {            // avg_win 仅对特许池定义
@@ -1056,9 +1297,15 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
                     acc.sum_win += slot_all;
                 }
             }
-            got_up_banner = true;
-            // 赠送十连出 UP 不重置 pity_since_last_up (独立通道); 正常出 UP/限定 重置
-            if (!isFree) pity_since_last_up = 0;
+            // 只有【本体抽】出的 UP 才消耗硬保底额度。赠送十连是独立通道, 官方明确
+            // 「加急招募所赠送的免费十连, 其抽取结果将不计入本次或其他寻访的保底计数」——
+            // 免费十连里出了 UP, 本体的 120 抽硬保底依然成立。
+            // (该问题在 main 上就存在, 不是重构池引入的: 旧写法无条件置 true, 会让免费出 UP
+            //  之后那次真正由 120 硬保底强制出的 UP 被误算成一次随机"不歪", 抬高胜率。)
+            if (!isFree) {
+                up_gotten = true;
+                up_pity   = 0;   // 赠送十连出 UP 不重置水位 (独立通道)
+            }
         } else {
             // 非 UP/非限定六星 = 一次独立判定的“负”。终末地可连续歪多次, 全部如实计入。
             acc.lose_5050++;
@@ -1070,7 +1317,10 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     // 右删失:遍历结束时若仍有未结算的 pity,记录为删失样本
     // 这些抽数"存活"到了 current_pity 抽仍未出 6 星(或 UP)
     acc.censored_pity_all = current_pity;
-    acc.censored_pity_up  = pity_since_last_up;
+    // 右删失的 UP 水位: 重构池取【最后活动的那个系列】的进度 (界面"当前垫刀"关心的是
+    //   玩家正在抽的那期), 其余池型仍用函数级的单份状态。
+    acc.censored_pity_up  = (isRefactor && last_series) ? last_series->pity_up
+                                                        : pity_since_last_up;
 
     // 防御性 clamp:即使数据异常导致 max_pity / censored_pity > 249,
     // 后续 ComputeKS 与 hazard 循环的索引访问也必须安全
@@ -1101,9 +1351,11 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         s.ci_all_err = t_crit * std_all / std::sqrt((double)acc.count_all);
 
         // K-S 检验:角色池用 g_cdf_char(ggpipi 模型),武器池用 g_cdf_wep(Reddit 模型)
+        // 重构寻访另用 g_cdf_refactor —— 与 g_cdf_char 只差赠送十连节点 (30 → 30/60)
         const std::span<const double> cdf_tbl = isWeapon
-            ? std::span<const double>(g_cdf_wep)      // 41
-            : std::span<const double>(g_cdf_char);    // 82
+            ? std::span<const double>(g_cdf_wep)          // 41
+            : (isRefactor ? std::span<const double>(g_cdf_refactor)   // 82
+                          : std::span<const double>(g_cdf_char));     // 82
         s.ks_d_all = ComputeKS(acc.freq_all, acc.max_pity_all, acc.count_all,
                                cdf_tbl);
         s.ks_is_normal = (s.ks_d_all <= (1.36 / std::sqrt((double)acc.count_all)));
@@ -1138,10 +1390,25 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         // v0.1.2.2: 辉光庆典走 g_cdf_joint_up (真实前向迭代, n=30 处展开免费十连)
         // 注意 isJoint 时 freq_up 的"事件"语义是"距上次限定的抽数", 与 g_cdf_joint_up
         // 描述的"首次非常驻六星"分布一致 (因为 pity_since_last_up 在每次出限定后重置)。
-        std::span<const double> cdf_up_tbl;          // v0.1.3.3: 长度由 span 自带
-        if (isWeapon)      cdf_up_tbl = g_cdf_wep_up;    // 81
-        else if (isJoint)  cdf_up_tbl = g_cdf_joint_up;  // 242
-        else               cdf_up_tbl = g_cdf_char_up;   // 122
+        // ★ 选表必须是一条【完整闭合】的 if/else 链, 且后面不能再紧跟别的 if ——
+        //   v0.1.4.0 曾在这条链和它的 else 之间插进一个 if, 结果 else 改绑到了新 if 上,
+        //   武器池/辉光池/只有 1 个 UP 的重构池全部被覆盖成 g_cdf_char_up。编译无警告,
+        //   在真实数据上武器池的 D 值从 0.2603 被抬到 0.4241。之后若要在这里加逻辑,
+        //   请加在整条链【结束之后】, 并保持每个分支都带花括号。
+        std::span<const double> cdf_up_tbl;                     // v0.1.3.3: 长度由 span 自带
+        if      (isWeapon)   { cdf_up_tbl = g_cdf_wep_up;      }  // 81
+        else if (isJoint)    { cdf_up_tbl = g_cdf_joint_up;    }  // 242
+        else if (isRefactor) { cdf_up_tbl = g_cdf_refactor_up; }  // 122
+        else                 { cdf_up_tbl = g_cdf_char_up;     }  // 122
+
+        // g_cdf_refactor_up 描述的是【系列内第一个 UP】的分布 —— 它在 n=120 强制收敛到 1,
+        // 依据是「前120次寻访必定获取 UP, 该规则在同名重构寻访中仅生效 1 次」。
+        // 而 freq_up 记的是每两个 UP 之间的间隔: 第 2 个及以后的 UP 已经没有这个兜底,
+        // 分布是无截断的长尾。两者不是同一个统计对象, 一旦样本里出现第 2 个 UP,
+        // 整体就成了混合分布, 再拿这条曲线判"符合/偏离"就没有依据了。
+        // 这不需要等到复刻才会发生 —— 首期追潜多抽一个 UP 就会遇到。
+        // 故这里只标记, 由输出层把判定改成"样本混合"; D 值仍照常算出供参考。
+        s.ks_up_mixed = (isRefactor && acc.count_up > 1);
         if (isWeapon) {
             // v0.1.3.3 武器 UP K-S: 先把经验 freq_up 按申领 (10 抽) 粒度向上聚合再比较。
             // 原因: g_cdf_wep_up 的质量只在 10 倍数边界记账 (申领内平坦, 机制如此),
@@ -1278,6 +1545,7 @@ struct ProcessOutput {
     StatsResult statsChar;
     StatsResult statsWep;
     StatsResult statsJoint;
+    StatsResult statsRefactor;
     std::wstring outMsg;
     std::wstring errMsg;
 
@@ -1373,15 +1641,27 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
         RankType  rt = ParseRankType (ExtractJsonValue(itemStr, "rank_type",  true));
         GachaType gt = ParseGachaType(ExtractJsonValue(itemStr, "gacha_type", true));
 
-        // 角色路径: Special (特许寻访) 或 Joint (辉光庆典) 都进入角色统计流程,
-        // 但分别送入 bucketChar / bucketJoint, 在下方按 gt 分桶 (机制独立、保底不继承)
+        // 角色路径: Special (特许寻访) / Joint (辉光庆典) / Refactor (重构寻访) 都进入
+        // 角色统计流程, 但分别送入 bucketChar / bucketJoint / bucketRefac,
+        // 在下方按 gt 分桶 (三套机制独立、保底互不继承)
         bool charPath = (it == ItemType::Character &&
-                         (gt == GachaType::Special || gt == GachaType::Joint));
+                         (gt == GachaType::Special || gt == GachaType::Joint ||
+                          gt == GachaType::Refactor));
         bool wepPath  = (it == ItemType::Weapon &&
                          gt != GachaType::Constant &&
                          gt != GachaType::Standard &&
                          gt != GachaType::Beginner);
         if (!charPath && !wepPath) return;
+
+        // v0.1.4.0 幽灵记录防御:「寻访情报书」(kind = "gift_intel_book") 会混在
+        //   /api/record/char 的 list 里返回 —— 它不是一次寻访, 没有 charId / charName,
+        //   也没有 rarity。新版 main.cpp 已在导出侧滤掉, 但【旧版导出的 uigf_endfield.json
+        //   里可能已经存了这类条目】, 那些记录的 rank_type 是空串 → RankType::Unknown。
+        //   若照单全收, 它们会被当成"一次没出六星的抽卡"而把保底水位多推 1 抽
+        //   (每 60 抽一本, 特许池尤其明显)。稀有度是每条真实抽卡记录必有的字段,
+        //   所以这里用 rank_type 解析失败作为判据, 安全且不会误删真实记录。
+        //   上游同类工具的判据是 kind != "gift_intel_book" (bhaoo/endfield-gacha #44 等)。
+        if (rt == RankType::Unknown) return;
 
         std::string_view name = ExtractJsonValue(itemStr, "item_name", true);
         std::string_view poolName = ExtractJsonValue(itemStr, "pool_name", true);
@@ -1435,21 +1715,32 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
     PullBucket bucketChar (alloc); bucketChar.reserve(4000);
     PullBucket bucketWep  (alloc); bucketWep .reserve(2000);
     PullBucket bucketJoint(alloc); bucketJoint.reserve(2000);
+    PullBucket bucketRefac(alloc); bucketRefac.reserve(1000);
     for (const auto& t : temps) {
         if (t.it == ItemType::Character) {
-            // 角色记录: 按 gacha_type 分桶, Special / Joint 各走各的 (机制独立、保底不继承)
-            if      (t.gt == GachaType::Special) bucketChar .push_back(t.rt, t.name, t.poolName, t.isFree);
-            else if (t.gt == GachaType::Joint)   bucketJoint.push_back(t.rt, t.name, t.poolName, t.isFree);
+            // 角色记录: 按 gacha_type 分桶, Special / Joint / Refactor 各走各的
+            // (三者机制独立: 保底作用域、赠送十连次数、有无 120 硬保底都不同)
+            if      (t.gt == GachaType::Special)  bucketChar .push_back(t.rt, t.name, t.poolName, t.isFree);
+            else if (t.gt == GachaType::Joint)    bucketJoint.push_back(t.rt, t.name, t.poolName, t.isFree);
+            else if (t.gt == GachaType::Refactor) bucketRefac.push_back(t.rt, t.name, t.poolName, t.isFree);
             // 其它角色池 (Standard/Beginner) 已在解析阶段 charPath 过滤,这里到不了
         } else {
             // 武器记录 (charPath=false → wepPath=true, 否则上面 return 了)
+            // 注: 「重构申领」(poolId rerun_wpn_*) 的六星概率/40/80 保底与常规武库申领
+            //   逐字段相同 (客户端 GachaWeaponPoolTypeTable type=0 与 type=1 完全一致),
+            //   故直接并入武器桶。已知差异: 重构申领的第 8 次申领 UP 保底在【同名系列】
+            //   之间继承且一生仅生效 1 次 (常规申领每期清零) —— 首期「点绘申领」是史上
+            //   第一期重构申领, 还不存在可继承的历史, 故当前无影响; 待 #2 复刻时再拆分。
+            //   官方原文: https://endfield.hypergryph.com/news/4776
             bucketWep.push_back(t.rt, t.name, t.poolName, t.isFree);
         }
     }
 
-    out->statsChar  = Calculate(bucketChar,  /*isWeapon=*/false, stdChars, poolMap, /*isJoint=*/false);
-    out->statsWep   = Calculate(bucketWep,   /*isWeapon=*/true,  stdWeps,  {},      /*isJoint=*/false);
-    out->statsJoint = Calculate(bucketJoint, /*isWeapon=*/false, stdChars, {},      /*isJoint=*/true);
+    out->statsChar     = Calculate(bucketChar,  /*isWeapon=*/false, stdChars, poolMap, /*isJoint=*/false);
+    out->statsWep      = Calculate(bucketWep,   /*isWeapon=*/true,  stdWeps,  {},      /*isJoint=*/false);
+    out->statsJoint    = Calculate(bucketJoint, /*isWeapon=*/false, stdChars, {},      /*isJoint=*/true);
+    out->statsRefactor = Calculate(bucketRefac, /*isWeapon=*/false, stdChars, poolMap, /*isJoint=*/false,
+                                   /*isRefactor=*/true);
 
     // 在 worker 渲染输出文本(swprintf 是 thread-safe;只有 SetWindowTextW 不是)
     wchar_t winCharStr[64] = L"[无数据]";
@@ -1474,6 +1765,14 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
         swprintf(pendJointStr, 96, L"  [当前垫刀: 距上次六星 %d 抽 / 距上次限定 %d 抽]",
                  out->statsJoint.censored_pity_all, out->statsJoint.censored_pity_up);
     }
+    wchar_t pendRefacStr[96] = L"";
+    if (out->statsRefactor.censored_pity_all > 0 || out->statsRefactor.censored_pity_up > 0) {
+        swprintf(pendRefacStr, 96, L"  [当前垫刀: 距上次六星 %d 抽 / 距上次 UP %d 抽]",
+                 out->statsRefactor.censored_pity_all, out->statsRefactor.censored_pity_up);
+    }
+    wchar_t winRefacStr[64] = L"[无数据]";
+    if (out->statsRefactor.avg_win >= 0)
+        swprintf(winRefacStr, 64, L"%.2f 抽", out->statsRefactor.avg_win);
 
     auto ksLabel = [](const StatsResult& r) -> const wchar_t* {
         if (r.count_all == 0) return L"-";
@@ -1481,6 +1780,8 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
     };
     auto ksUpLabel = [](const StatsResult& r) -> const wchar_t* {
         if (r.count_up == 0) return L"-";
+        // 混合样本 (首个 UP 带 120 兜底 / 后续 UP 无兜底) 没有单一理论分布可比, 不作判定
+        if (r.ks_up_mixed)   return L"样本混合, 不判定";
         return r.ks_is_normal_up ? L"符合理论模型" : L"偏离过大";
     };
     const wchar_t* ksCharLabel    = ksLabel  (out->statsChar);
@@ -1489,11 +1790,14 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
     const wchar_t* ksCharUpLabel  = ksUpLabel(out->statsChar);
     const wchar_t* ksWepUpLabel   = ksUpLabel(out->statsWep);
     const wchar_t* ksJointUpLabel = ksUpLabel(out->statsJoint);
+    const wchar_t* ksRefacLabel   = ksLabel  (out->statsRefactor);
+    const wchar_t* ksRefacUpLabel = ksUpLabel(out->statsRefactor);
 
-    // 缓冲区从 2880 扩到 4096: 新增辉光庆典一个完整池块, 字符数约 +900,
-    // 4096 留出安全余量, 避免 swprintf 截断 (截断会让 SetWindowTextW 显示残缺尾巴)。
-    wchar_t outMsg[4096];
-    swprintf(outMsg, 4096,
+    // 缓冲区 2880 → 4096 (v0.1.2.0 新增辉光庆典块) → 5632 (v0.1.4.0 新增重构寻访块)。
+    // 每个完整池块约 +900 字符, 留出安全余量避免 swprintf 截断
+    // (截断会让 SetWindowTextW 显示残缺尾巴)。
+    wchar_t outMsg[5632];
+    swprintf(outMsg, 5632,
         L"【角色卡池 (特许寻访)】 总计六星: %d | 出当期 UP: %d%ls\r\n"
         L" ▶ 综合六星 (含歪) 出货平均期望:     %5.2f 抽 (理论 ≈ 51.81)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
         L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 79.29)   [95%% CI: %5.1f ~ %5.1f]    |   真实不歪率: %5.1f%% (理论 50%%) (%d胜%d负)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
@@ -1501,6 +1805,10 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
         L"【角色卡池 (辉光庆典)】 总计六星: %d | 出限定 (非常驻): %d%ls\r\n"
         L" ▶ 综合六星 (含常驻) 出货平均期望:   %5.2f 抽 (理论 ≈ 51.81)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
         L" ▶ 抽到任一限定 (非常驻) 的平均期望: %5.2f 抽 (理论 ≈ 104.68)  [95%% CI: %5.1f ~ %5.1f]    |   非常驻六星率: %5.1f%% (理论 50%%) (%d限定%d常驻)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n\r\n"
+        L"【角色卡池 (重构寻访)】 总计六星: %d | 出当期 UP: %d%ls\r\n"
+        L" ▶ 综合六星 (含歪) 出货平均期望:     %5.2f 抽 (理论 ≈ 51.37)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
+        L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 77.83)   [95%% CI: %5.1f ~ %5.1f]    |   真实不歪率: %5.1f%% (理论 50%%*) (%d胜%d负)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
+        L" ▶ 赢下小保底 (不歪) 的出货期望:     %ls\t\t(* UP 占比官方未公布, 暂沿用特许寻访的 50%%, 待开池后核实)\r\n\r\n"
         L"【武器卡池 (武库申领)】 总计六星: %d | 出当期 UP: %d%ls\r\n"
         L" ▶ 综合六星出货平均期望:             %5.2f 抽 (理论 ≈ 19.17)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
         L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 54.74)   [95%% CI: %5.1f ~ %5.1f]    |   6 星中 UP 率: %5.1f%% (理论 25%%) (%d UP / %d 非UP)\t[K-S 检验偏离度 D值: %.3f (%ls)]",
@@ -1523,6 +1831,16 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
         out->statsJoint.win_rate_5050 >= 0 ? out->statsJoint.win_rate_5050 * 100.0 : 0.0,
         out->statsJoint.win_5050, out->statsJoint.lose_5050,
         out->statsJoint.ks_d_up, ksJointUpLabel,
+        out->statsRefactor.count_all, out->statsRefactor.count_up, pendRefacStr,
+        out->statsRefactor.avg_all, (std::max)(1.0, out->statsRefactor.avg_all - out->statsRefactor.ci_all_err),
+        out->statsRefactor.avg_all + out->statsRefactor.ci_all_err, out->statsRefactor.cv_all * 100.0,
+        out->statsRefactor.ks_d_all, ksRefacLabel,
+        out->statsRefactor.avg_up, (std::max)(1.0, out->statsRefactor.avg_up - out->statsRefactor.ci_up_err),
+        out->statsRefactor.avg_up + out->statsRefactor.ci_up_err,
+        out->statsRefactor.win_rate_5050 >= 0 ? out->statsRefactor.win_rate_5050 * 100.0 : 0.0,
+        out->statsRefactor.win_5050, out->statsRefactor.lose_5050,
+        out->statsRefactor.ks_d_up, ksRefacUpLabel,
+        winRefacStr,
         out->statsWep.count_all, out->statsWep.count_up, pendWepStr,
         out->statsWep.avg_all, (std::max)(1.0, out->statsWep.avg_all - out->statsWep.ci_all_err),
         out->statsWep.avg_all + out->statsWep.ci_all_err, out->statsWep.cv_all * 100.0,
@@ -1629,10 +1947,14 @@ bool ProcessFile_Submit(HWND hwnd, const std::wstring& path) {
 // 主线程消费 worker 结果. 必须在 WM_APP_PROCESS_DONE 里调用
 void ProcessFile_Consume(HWND hwnd, ProcessOutput* out) {
     if (out->ok) {
-        // 把结果搬到全局 statsChar/statsWep/statsJoint (主线程独占,不需要锁)
-        statsChar  = out->statsChar;
-        statsWep   = out->statsWep;
-        statsJoint = out->statsJoint;
+        // 把结果搬到全局 (主线程独占,不需要锁)。
+        // ★ 这里【每加一个池子就必须同步加一行】—— 图表绘制读的是这些全局量, 不是
+        //   out-> 里的字段。v0.1.4.0 曾漏掉 statsRefactor, 导致文字统计有六星、
+        //   重构寻访的两张图却始终显示"暂无出金数据"。
+        statsChar     = out->statsChar;
+        statsWep      = out->statsWep;
+        statsJoint    = out->statsJoint;
+        statsRefactor = out->statsRefactor;
         SetWindowTextW(hOutEdit, out->outMsg.c_str());
         RebuildChartCache(hwnd);
         InvalidateRect(hwnd, NULL, FALSE);
@@ -2452,10 +2774,177 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     }
 }
 
-void RebuildChartCache(HWND hwnd) {
+// ---------------------------------------------------------
+// [响应式布局 + 垂直滚动]  v0.1.4.0
+//
+// 参考 Apple 版 (shangyuan0818/Endfield-Gacha-Apple) macOS ContentView.swift 的做法:
+//   整个主区域套一层 ScrollView; 图表宽度撑满父容器 (maxWidth: .infinity),
+//   高度给 minHeight 保底, 窗口够高时几行图表平分剩余空间。
+//   原注释:「小屏 MacBook 缩小窗口时武器卡池/底部图表会被 Dock 或屏幕底端遮挡,
+//            这里让用户能滚动查看」——— Windows 端在加入第 4 行图表后是同样的问题。
+//
+// Win32 等价实现:
+//   - 窗口恢复可缩放 (WS_THICKFRAME | WS_MAXIMIZEBOX), 并加 WS_VSCROLL
+//   - 所有子控件与图表的坐标改由 ComputeLayout() 从客户区尺寸算出, 不再写死常量
+//   - 内容总高 > 客户区高时可滚动。滚动【不重绘图表】: 图表位图按"内容坐标系"缓存
+//     (高度 = contentH 而非客户区高), 滚动只改 BitBlt 的源点 Y 与子控件的 Y 偏移。
+//   - 滚动条用 SIF_DISABLENOSCROLL 常驻显示 (内容装得下时变灰而非隐藏)。这样客户区
+//     宽度不会因滚动条显隐而跳变, 避免 SetScrollInfo → WM_SIZE → SetScrollInfo 的
+//     重入抖动。
+//
+// 坐标约定: 下面 ui:: 里的 k* 常量是【逻辑像素】, Layout 结构体里的字段是
+//           【物理像素】(已过 DPIScale)。
+// ---------------------------------------------------------
+namespace ui {
+    constexpr int kMarginX      = 20;   // 左右留白
+    constexpr int kMarginBottom = 20;
+    constexpr int kLabelW       = 95;
+    constexpr int kEditX        = 120;  // 标签右侧, 输入框起点
+    constexpr int kHintY        = 15;
+    constexpr int kRowY0        = 40;   // 第一行输入框 (常驻六星角色)
+    constexpr int kRowStep      = 30;   // 行距
+    constexpr int kLabelDY      = 5;    // 标签相对同行输入框的垂直微调
+    constexpr int kEditH        = 26;
+    constexpr int kLabelH       = 20;
+    constexpr int kOutY         = 135;  // 输出文本框顶端
+    constexpr int kOutH         = 280;  // 输出文本框高度 (4 个池块)
+    constexpr int kChartGapX    = 20;   // 同一行左右两图之间
+    constexpr int kChartGapY    = 5;    // 上下两行之间
+    constexpr int kChartMinRowH = 250;  // 单行图表最小高度 (等价 Apple 的 minHeight)
+    constexpr int kChartRows    = 4;    // 特许 / 辉光 / 重构 / 武器
+    constexpr int kMinWindowW   = 900;  // 再窄图表就没法读了
+    constexpr int kMinWindowH   = 360;
+    constexpr int kScrollLine   = 30;   // 一次 SB_LINEUP/DOWN 的步长
+}
+
+struct Layout {
+    int clientW = 0, clientH = 0;   // 客户区尺寸 (物理像素)
+    int contentH = 0;               // 内容总高, 滚动范围的依据
+    int editX = 0, editW = 0;       // 三个配置输入框
+    int outY = 0, outH = 0, outW = 0;
+    int chartX1 = 0, chartX2 = 0;   // 左列 / 右列 X
+    int chartTop = 0, chartW = 0, chartRowH = 0;
+    // 第 i 行 (0-based) 图表的顶端 Y, 内容坐标系
+    int RowY(int i) const { return chartTop + i * (chartRowH + DPIScale(ui::kChartGapY)); }
+};
+
+Layout ComputeLayout(HWND hwnd) {
+    Layout L;
     RECT rc; GetClientRect(hwnd, &rc);
-    int w = rc.right, h = rc.bottom;
+    L.clientW = (int)rc.right; L.clientH = (int)rc.bottom;   // RECT 成员是 LONG, 显式收敛
+    if (L.clientW <= 0 || L.clientH <= 0) return L;
+
+    const int mx = DPIScale(ui::kMarginX);
+    L.editX = DPIScale(ui::kEditX);
+    // clamp 到一个正的最小值: 窗口被拖到极窄时 (WM_GETMINMAXINFO 之外仍可能发生,
+    // 例如最小化/还原过程中的瞬时尺寸) 避免出现负宽度传给 MoveWindow/位图。
+    L.editW = (std::max)(DPIScale(40), L.clientW - L.editX - mx);
+    L.outW  = (std::max)(DPIScale(40), L.clientW - 2 * mx);
+    L.outY  = DPIScale(ui::kOutY);
+    L.outH  = DPIScale(ui::kOutH);
+
+    L.chartTop = L.outY + L.outH + DPIScale(ui::kChartGapY);
+    L.chartW   = (std::max)(DPIScale(80),
+                            (L.clientW - 2 * mx - DPIScale(ui::kChartGapX)) / 2);
+    L.chartX1  = mx;
+    L.chartX2  = mx + L.chartW + DPIScale(ui::kChartGapX);
+
+    // 行高: 客户区给 4 行图表剩多少。够高就平分 (等价 Apple 那边"填满容器"的行为),
+    // 不够就退回最小行高, 内容溢出客户区 → 由滚动条兜住。
+    const int gapsY = (ui::kChartRows - 1) * DPIScale(ui::kChartGapY);
+    const int avail = L.clientH - L.chartTop - DPIScale(ui::kMarginBottom) - gapsY;
+    L.chartRowH = (std::max)(DPIScale(ui::kChartMinRowH), avail / ui::kChartRows);
+
+    L.contentH = L.chartTop + ui::kChartRows * L.chartRowH + gapsY + DPIScale(ui::kMarginBottom);
+    // 平分时的整除误差会让 contentH 比 clientH 少几像素, 那样 WM_PAINT 会 BitBlt 到
+    // 位图外边; 这里抬平到至少等于客户区高。
+    if (L.contentH < L.clientH) L.contentH = L.clientH;
+    return L;
+}
+
+// 按当前 g_scrollY 摆放全部子控件。子控件跟随内容一起滚动 (与 Apple 版把配置行也放进
+// ScrollView 的行为一致), 所以统一加 -g_scrollY 的 Y 偏移。
+void LayoutChildren(HWND hwnd, const Layout& L) {
+    (void)hwnd;                          // 摆位只用子窗口句柄, 父句柄留着保持接口对称
+    if (!hCharEdit) return;              // WM_CREATE 还没建完控件
+    const int mx = DPIScale(ui::kMarginX);
+    const int dy = -g_scrollY;
+
+    // 先把 8 个控件的目标位置算齐, 再统一提交。分两步是为了让 DeferWindowPos 中途失败时
+    // 能【整体】退回 MoveWindow —— 边算边 Defer 的话, 一旦失败, 之前已入队的那几个控件
+    // 会随着 HDWP 作废而停在原位, 出现"一半控件跟着滚、一半不动"的错位。
+    struct Place { HWND h; int x, y, w, hgt; };
+    Place places[8];
+    int n = 0;
+    auto add = [&](HWND h, int x, int y, int w, int hgt) {
+        if (h && n < 8) places[n++] = Place{h, x, y + dy, w, hgt};
+    };
+    add(hHintLabel, mx, DPIScale(ui::kHintY),
+        (std::max)(DPIScale(100), L.clientW - 2 * mx), DPIScale(ui::kLabelH));
+    for (int i = 0; i < 3; ++i) {
+        const int rowY = DPIScale(ui::kRowY0 + i * ui::kRowStep);
+        HWND lbl  = (i == 0) ? hCharLabel : (i == 1) ? hPoolMapLabel : hWepLabel;
+        HWND edit = (i == 0) ? hCharEdit  : (i == 1) ? hPoolMapEdit  : hWepEdit;
+        add(lbl,  mx,      rowY + DPIScale(ui::kLabelDY), DPIScale(ui::kLabelW), DPIScale(ui::kLabelH));
+        add(edit, L.editX, rowY,                          L.editW,               DPIScale(ui::kEditH));
+    }
+    add(hOutEdit, mx, L.outY, L.outW, L.outH);
+
+    // 批量摆位, 减少缩放/滚动时的闪烁
+    HDWP hdwp = BeginDeferWindowPos(n);
+    for (int i = 0; i < n && hdwp; ++i) {
+        hdwp = DeferWindowPos(hdwp, places[i].h, NULL,
+                              places[i].x, places[i].y, places[i].w, places[i].hgt,
+                              SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (hdwp) { EndDeferWindowPos(hdwp); return; }
+    for (int i = 0; i < n; ++i)          // 兜底: 批量提交失败时逐个摆
+        MoveWindow(places[i].h, places[i].x, places[i].y, places[i].w, places[i].hgt, TRUE);
+}
+
+void UpdateScrollInfo(HWND hwnd, const Layout& L) {
+    g_contentH = L.contentH;
+    SCROLLINFO si = { sizeof(si) };
+    // SIF_DISABLENOSCROLL: 内容装得下时把滚动条置灰而不是隐藏, 客户区宽度因此恒定,
+    // 不会触发 "设滚动条 → 客户区变窄 → WM_SIZE → 再设滚动条" 的重入。
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL;
+    si.nMin  = 0;
+    si.nMax  = L.contentH - 1;
+    si.nPage = (UINT)L.clientH;
+    si.nPos  = g_scrollY;
+    SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+    // 系统会按 range/page 夹紧 nPos, 读回来才是真实生效值
+    si.fMask = SIF_POS;
+    if (GetScrollInfo(hwnd, SB_VERT, &si)) g_scrollY = si.nPos;
+}
+
+// 滚动到指定位置。图表缓存按内容坐标系画好且与滚动无关, 所以这里【不】重建位图,
+// 只重新摆子控件 + 触发一次 WM_PAINT 换 BitBlt 源点 —— 滚动因此是廉价操作。
+void ScrollTo(HWND hwnd, int pos) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    // RECT 成员是 LONG, 与 int 混用会让 std::max 的模板实参推导出现歧义 (MSVC C2672),
+    // 故先显式收敛到 int 再比较。下面 ComputeLayout 里也是同样的处理。
+    const int clientH = (int)rc.bottom;
+    const int maxPos  = (std::max)(0, g_contentH - clientH);
+    pos = (std::min)((std::max)(pos, 0), maxPos);
+    if (pos == g_scrollY) return;
+    g_scrollY = pos;
+    SCROLLINFO si = { sizeof(si) };
+    si.fMask = SIF_POS; si.nPos = g_scrollY;
+    SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+    LayoutChildren(hwnd, ComputeLayout(hwnd));
+    InvalidateRect(hwnd, NULL, FALSE);   // WM_ERASEBKGND 恒返回 1, 不需要擦除
+}
+
+void RebuildChartCache(HWND hwnd) {
+    const Layout L = ComputeLayout(hwnd);
+    // v0.1.4.0: 位图不再是"客户区大小", 而是【内容坐标系】的整幅高度 (contentH)。
+    //   滚动时只换 BitBlt 的源点 Y, 不必重画; 只有尺寸变化才需要重建。
+    //   代价是位图内存 = clientW × contentH × 4B (1260×1460 约 7MB; 4K 全屏下约 23MB),
+    //   对本工具可接受, 换来的是滚动完全不掉帧。
+    const int w = L.clientW, h = L.contentH;
     if (w <= 0 || h <= 0) return;
+    RECT rc = {0, 0, w, h};
 
     HDC hdcWnd = GetDC(hwnd);
     HDC hdcMem = CreateCompatibleDC(hdcWnd);
@@ -2478,21 +2967,20 @@ void RebuildChartCache(HWND hwnd) {
         Gdiplus::Graphics g(hdcMem);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
 
-        // 布局 (v0.1.2.0, 与 WM_CREATE 中的控件 Y 坐标保持同步):
-        //   header inputs   :  15 -  130
-        //   output text     : 135 -  380  (h=245, 比原 215 多 30 容纳辉光庆典块)
-        //   char  row (蓝)  : 390 -  640  (h=250)
-        //   joint row (青)  : 645 -  895  (h=250)
-        //   wep   row (红)  : 900 - 1150  (h=250)
-        //
-        // 三行均"图左 ECDF / 图右 MRL", 总宽 1240 (20 + 600 + 20 + 600 = 1240).
-        // 修改这里的 Y 时, WinMain 中窗口高度 1170 与 WM_CREATE 中 hOutEdit 的尺寸
-        // 也要同步, 三处必须一致, 否则要么 widget 溢出窗口要么底部出现空白带。
+        // 布局 (v0.1.4.0 起全部由 ComputeLayout() 从客户区尺寸算出, 不再写死坐标):
+        //   header inputs :  15 .. kOutY            (三行"标签 + 输入框", 输入框宽度跟随窗口)
+        //   output text   :  kOutY, 高 kOutH
+        //   四行图表      :  L.RowY(0..3), 每行 "左 ECDF / 右 MRL"
+        //     row0 特许寻访(蓝) / row1 辉光庆典(青) / row2 重构寻访(紫) / row3 武库申领(红)
+        //   每张图宽 = (客户区宽 - 两侧留白 - 中缝) / 2, 随窗口横向缩放;
+        //   行高 = 剩余高度四等分, 但不低于 kChartMinRowH, 低于就靠滚动条查看。
+        // 注意这里画的是【内容坐标系】(Y 不减 g_scrollY) —— 滚动发生在 WM_PAINT 的
+        // BitBlt 源点上, 见 WM_PAINT / ScrollTo。
 
         // ===== 角色池 (特许寻访) =====
         // 角色 ECDF: X 轴覆盖 UP 硬保底 120 (UP 分布延伸到此)
         // v0.1.1 起新增 UP 理论 CDF (g_cdf_char_up): 双状态前向迭代算法
-        DrawECDF  (g, Gdiplus::Rect(DPIScale(20),  DPIScale(390), DPIScale(600), DPIScale(250)),
+        DrawECDF  (g, Gdiplus::Rect(L.chartX1, L.RowY(0), L.chartW, L.chartRowH),
                    statsChar.freq_all, statsChar.freq_up,
                    statsChar.count_all, statsChar.count_up,
                    statsChar.censored_pity_all, statsChar.censored_pity_up,
@@ -2500,7 +2988,7 @@ void RebuildChartCache(HWND hwnd) {
                    L"角色 (特许寻访) 累积分布 (ECDF)", 120,
                    /*ecdf_up_step_size=*/1);
         // 角色 MRL: X=80 是综合 6 星硬保底 (理论 MRL 上限), X=120 是 UP 硬保底
-        DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(390), DPIScale(600), DPIScale(250)),
+        DrawMRL   (g, Gdiplus::Rect(L.chartX2, L.RowY(0), L.chartW, L.chartRowH),
                    statsChar.freq_all, statsChar.freq_up,
                    statsChar.count_all, statsChar.count_up,
                    statsChar.censored_pity_all, statsChar.censored_pity_up,
@@ -2525,14 +3013,14 @@ void RebuildChartCache(HWND hwnd) {
         //   MRL 计算用解析长尾延伸 (g_joint_tail_mean_excess), 把 CDF 在 240 之后的
         //   ~7% 长尾质量用单点近似补回, 让 MRL[0] 从无延伸的 ~82 修正回真值 ~104.68.
         //   drawTheoryCDF 仍画到数组末端 (cdf[240]≈0.93), ECDF 视觉上诚实显示截断.
-        DrawECDF  (g, Gdiplus::Rect(DPIScale(20),  DPIScale(645), DPIScale(600), DPIScale(250)),
+        DrawECDF  (g, Gdiplus::Rect(L.chartX1, L.RowY(1), L.chartW, L.chartRowH),
                    statsJoint.freq_all, statsJoint.freq_up,
                    statsJoint.count_all, statsJoint.count_up,
                    statsJoint.censored_pity_all, statsJoint.censored_pity_up,
                    g_cdf_char, g_cdf_joint_up,
                    L"角色 (辉光庆典) 累积分布 (ECDF)", 240,
                    /*ecdf_up_step_size=*/1);
-        DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(645), DPIScale(600), DPIScale(250)),
+        DrawMRL   (g, Gdiplus::Rect(L.chartX2, L.RowY(1), L.chartW, L.chartRowH),
                    statsJoint.freq_all, statsJoint.freq_up,
                    statsJoint.count_all, statsJoint.count_up,
                    statsJoint.censored_pity_all, statsJoint.censored_pity_up,
@@ -2541,11 +3029,36 @@ void RebuildChartCache(HWND hwnd) {
                    /*theory_all_cap=*/80, /*theory_up_cap=*/240,
                    /*tail_mean_excess_up=*/g_joint_tail_mean_excess);
 
+        // ===== 重构寻访 (Refactor / RE-Factor, 1.5 新增) =====
+        // 首期「绚丽异彩」重构寻访#1, 2026/09/24 12:00 开启, UP = 伊冯 (旧限定复刻)。
+        // 池中六星只有 6 个 = 当期 UP + 5 名常驻 (不含往期滞留的限定角), 所以"非常驻 = UP"
+        //   这条判定在本池是严格成立的 —— 比特许池 (8 个六星, 含前两期限定) 还干净。
+        // 数值与特许寻访逐字段相同 (0.8% 基础 / 66 抽起 +5% 软保底 / 80 硬保底 / 120 UP 硬保底),
+        //   唯一差异是赠送十连从 1 次 (累计 30 抽) 变成 3 次 (累计 30/60/90 抽),
+        //   故综合与 UP 都另建表: g_cdf_refactor / g_cdf_refactor_up (见 InitCDFTables)。
+        //   E[首六星] ≈ 51.37 (特许 51.81), E[首 UP] ≈ 77.83 (特许 79.29) —— 多出的两次
+        //   赠送十连让两个期望都略微下降。
+        // X 轴与特许池一致取 120 (UP 硬保底), MRL 的理论上限同为 80 / 120。
+        DrawECDF  (g, Gdiplus::Rect(L.chartX1, L.RowY(2), L.chartW, L.chartRowH),
+                   statsRefactor.freq_all, statsRefactor.freq_up,
+                   statsRefactor.count_all, statsRefactor.count_up,
+                   statsRefactor.censored_pity_all, statsRefactor.censored_pity_up,
+                   g_cdf_refactor, g_cdf_refactor_up,
+                   L"角色 (重构寻访) 累积分布 (ECDF)", 120,
+                   /*ecdf_up_step_size=*/1);
+        DrawMRL   (g, Gdiplus::Rect(L.chartX2, L.RowY(2), L.chartW, L.chartRowH),
+                   statsRefactor.freq_all, statsRefactor.freq_up,
+                   statsRefactor.count_all, statsRefactor.count_up,
+                   statsRefactor.censored_pity_all, statsRefactor.censored_pity_up,
+                   g_cdf_refactor, g_cdf_refactor_up,
+                   L"角色 (重构寻访) 剩余抽数期望 (MRL)", 120,
+                   /*theory_all_cap=*/80, /*theory_up_cap=*/120);
+
         // ===== 武器池 =====
         // 武器 ECDF: X 轴覆盖 UP 硬保底 80
         // v0.1.1 起新增 UP 理论 CDF (g_cdf_wep_up): 4×8 状态机
         // ECDF 用真阶梯 (拨内 CDF 平坦, 10 倍数处跳跃) 体现"10 抽一组"机制
-        DrawECDF  (g, Gdiplus::Rect(DPIScale(20),  DPIScale(900), DPIScale(600), DPIScale(250)),
+        DrawECDF  (g, Gdiplus::Rect(L.chartX1, L.RowY(3), L.chartW, L.chartRowH),
                    statsWep.freq_all, statsWep.freq_up,
                    statsWep.count_all, statsWep.count_up,
                    statsWep.censored_pity_all, statsWep.censored_pity_up,
@@ -2553,7 +3066,7 @@ void RebuildChartCache(HWND hwnd) {
                    L"武器累积分布 (ECDF)", 80,
                    /*ecdf_up_step_size=*/10);
         // 武器 MRL: X=40 综合硬保底, X=80 UP 硬保底
-        DrawMRL   (g, Gdiplus::Rect(DPIScale(640), DPIScale(900), DPIScale(600), DPIScale(250)),
+        DrawMRL   (g, Gdiplus::Rect(L.chartX2, L.RowY(3), L.chartW, L.chartRowH),
                    statsWep.freq_all, statsWep.freq_up,
                    statsWep.count_all, statsWep.count_up,
                    statsWep.censored_pity_all, statsWep.censored_pity_up,
@@ -2575,45 +3088,158 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         hFont = CreateFontW(-DPIScale(13), 0, 0, 0, FW_NORMAL, 0, 0, 0,
                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
-        HWND hL1 = CreateWindowW(L"STATIC",
+        hHintLabel = CreateWindowW(L"STATIC",
             L"支持\x201C限定角色卡池:当期UP角色\x201D映射。未包含的限定角色卡池将仅排查常驻六星角色名单。",
             WS_CHILD | WS_VISIBLE,
             DPIScale(20), DPIScale(15), DPIScale(1000), DPIScale(20), hwnd, NULL, NULL, NULL);
-        HWND hL_Char = CreateWindowW(L"STATIC", L"常驻六星角色:",
+        // 常驻(基础寻访)六星角色。截至 2026-09-06 仍是这 5 人, 自公测以来【没有增补过】——
+        // 每期「特许寻访」公告都带同一条条款:「※ 在「特许寻访」中概率提升的6星干员, 将于
+        // 3次「特许寻访」结束后, 移出「特许寻访」全部可能出现的干员列表。移出后, 概率提升的
+        // 6星干员不会进入「基础寻访」。」即终末地【没有】限定角色下放常驻的机制。
+        // 数据源: 客户端 GachaCharPoolContentTable 的 standard / beginner 两池六星恒为这 5 人。
+        hCharLabel = CreateWindowW(L"STATIC", L"常驻六星角色:",
             WS_CHILD | WS_VISIBLE,
             DPIScale(20), DPIScale(45), DPIScale(95), DPIScale(20), hwnd, NULL, NULL, NULL);
         hCharEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W",
             L"骏卫,黎风,别礼,余烬,艾尔黛拉",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             DPIScale(120), DPIScale(40), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
-        HWND hL_PoolMap = CreateWindowW(L"STATIC", L"当期UP角色:",
+        hPoolMapLabel = CreateWindowW(L"STATIC", L"当期UP角色:",
             WS_CHILD | WS_VISIBLE,
             DPIScale(20), DPIScale(75), DPIScale(95), DPIScale(20), hwnd, NULL, NULL, NULL);
+        // 「卡池名 : 当期UP角色」映射。这份映射【必须补全】, 因为特许寻访池里的六星
+        // 恒为 8 个 = 当期 UP + 前两期的限定干员 + 5 名常驻 (限定角色 UP 期结束后还会
+        // 在池中滞留 2 期才移出)。例如「冬猎」池 = 提弗洛斯(UP)/梨诺/诀 + 5 常驻 ——
+        // 若缺映射而回退到"不在常驻名单 = UP"的排除法, 歪出的 梨诺/诀 会被误判成当期 UP。
+        // 下列 12 期与客户端 GachaCharPoolTable 的 name.cn / upCharIds 逐条核对一致:
+        //   special_1_0_1 熔火灼痕:莱万汀   special_1_0_2 热烈色彩:伊冯
+        //   special_1_0_3 轻飘飘的信使:洁尔佩塔  special_1_1_1 河流的女儿:汤汤
+        //   special_1_1_2 狼珀:洛茜        special_1_2_1 春雷动，万物生:庄方宜
+        //   special_1_3_1 拳出无悔:弭弗    special_1_3_2 逐罪者:卡缪
+        //   special_1_4_1 临渊望北:诀      special_1_4_2 晨星于此闪耀:梨诺
+        //   special_1_5_1 冬猎:提弗洛斯    rerun_chr_yvonne 绚丽异彩:伊冯 (重构寻访, 9/24 开)
+        // 注意「绚丽异彩」是伊冯的复刻, 与她 1.0 的原池「热烈色彩」并列, 两条都要留。
         hPoolMapEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W",
-            L"熔火灼痕:莱万汀,轻飘飘的信使:洁尔佩塔,热烈色彩:伊冯,河流的女儿:汤汤,狼珀:洛茜,春雷动，万物生:庄方宜,拳出无悔:弭弗",
+            L"熔火灼痕:莱万汀,轻飘飘的信使:洁尔佩塔,热烈色彩:伊冯,河流的女儿:汤汤,狼珀:洛茜,春雷动，万物生:庄方宜,拳出无悔:弭弗,逐罪者:卡缪,临渊望北:诀,晨星于此闪耀:梨诺,冬猎:提弗洛斯,绚丽异彩:伊冯",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             DPIScale(120), DPIScale(70), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
-        HWND hL_Wep = CreateWindowW(L"STATIC", L"常驻六星武器:",
+        hWepLabel = CreateWindowW(L"STATIC", L"常驻六星武器:",
             WS_CHILD | WS_VISIBLE,
             DPIScale(20), DPIScale(105), DPIScale(95), DPIScale(20), hwnd, NULL, NULL, NULL);
-        // 限定武器: 熔铸火焰、艺术暴君、使命必达、落草、狼之绯、孤舟、镀红祝福
+        // 这份名单的语义是【已知的"非当期 UP"六星武器白名单】: 武器池的 Calculate() 传的
+        // pool_map 是空的 {}, UP 判定 100% 靠"不在本名单里 ⇒ 当期 UP"。所以名单里混入一件
+        // 限定 UP 武器, 抽到它的玩家就会被记成"歪", 武器池 UP 率被系统性拉低。
+        //
+        // v0.1.4.0 修正: 删除【赤缨】。它是 1.3 上半「绛结申领」的当期 UP (弭弗专武),
+        //   是 2026-06-08 那次数据更新 (commit 5440f37) 一并塞进来的录入失误 ——
+        //   同批的 雾中微光/灯火使命/幻想苦痛 确实不是 UP, 只有赤缨归类错了。
+        //   证据: 把客户端 GachaWeaponPoolContentTable 全部 19 个武器池的六星按
+        //   isHardGuaranteeItem 展开后, "当 UP 出现过"与"当陪跑出现过"两个集合【完全不相交】,
+        //   赤缨只出现在 weponbox_1_3_1 的 UP 位, 从未作为陪跑六星出现在任何池里。
+        //   (也可用官方免 token 接口自查:
+        //    https://ef-webview.gryphline.com/api/content?lang=zh-cn&pool_id=<池ID>&server_id=3 )
+        //
+        // 限定武器 (只作为某期 UP 出现, 都【不该】进本名单):
+        //   熔铸火焰、艺术暴君、使命必达、落草、狼之绯、孤舟、赤缨、镀红祝福、
+        //   四二式·肃阵 (1.4 军列申领, 诀专武)、曜夜的首演 (1.4 明曜申领, 梨诺专武)、
+        //   寒夜幽影 (1.5 幽寒申领, 提弗洛斯专武)
+        //   注: "限定"不等于"只出现一次" —— 艺术暴君已在 9/24 的「点绘申领」(重构申领) 复刻。
+        //   注: 四二式·肃阵 中间是间隔号 U+00B7, 不是全角冒号也不是 ASCII 句点。
+        //
+        // 名单里另有 8 件是【通行证(武器补给)/活动直给】的六星: 黯色火炬、领航者、
+        //   作品：蚀迹、光荣记忆、望乡、雾中微光、灯火使命、幻想苦痛。它们不在任何申领池,
+        //   永远不会出现在 /api/record/weapon 里, 留着无害也无作用, 保留以免误删。
+        //
+        // 名单里的 赫拉芬格/沧溟星梦/不知归/负山/大雷斑 是 5 个【常驻武器申领池】
+        //   (weaponbox_constant_1..5, 长期开放) 各自的固定 UP。按上面的语义它们本不该在
+        //   白名单里, 但这些池的 poolId 含 "constant" → ParseGachaType 判为 GachaType::Constant
+        //   → 已被 wepPath 整体排除在武器统计之外, 记录根本进不了武器桶, 故留着无影响;
+        //   且按"常驻武器"的字面语义它们也确实属实。★ 若将来放开 Constant 池参与统计,
+        //   这 5 件必须同时从本名单移除, 否则常驻池玩家的 win_5050 会恒为 0。
         hWepEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W",
-            L"宏愿,不知归,黯色火炬,扶摇,热熔切割器,显赫声名,白夜新星,大雷斑,赫拉芬格,典范,昔日精品,破碎君王,J.E.T.,骁勇,负山,同类相食,楔子,领航者,骑士精神,遗忘,爆破单元,作品：蚀迹,沧溟星梦,光荣记忆,望乡,雾中微光,灯火使命,赤缨,幻想苦痛",
+            L"宏愿,不知归,黯色火炬,扶摇,热熔切割器,显赫声名,白夜新星,大雷斑,赫拉芬格,典范,昔日精品,破碎君王,J.E.T.,骁勇,负山,同类相食,楔子,领航者,骑士精神,遗忘,爆破单元,作品：蚀迹,沧溟星梦,光荣记忆,望乡,雾中微光,灯火使命,幻想苦痛",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
             DPIScale(120), DPIScale(100), DPIScale(1120), DPIScale(26), hwnd, NULL, NULL, NULL);
 
         hOutEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"RichEdit50W",
             L"等待拖入文件...",
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL,
-            DPIScale(20), DPIScale(135), DPIScale(1220), DPIScale(245), hwnd, NULL, NULL, NULL);
+            DPIScale(20), DPIScale(135), DPIScale(1220), DPIScale(280), hwnd, NULL, NULL, NULL);
 
         DWORD tabStops[] = {50};
         SendMessage(hOutEdit, EM_SETTABSTOPS, 1, (LPARAM)tabStops);
         SendMessage(hOutEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)GetSysColor(COLOR_3DFACE));
 
-        for (HWND h : {hL1, hL_Char, hCharEdit, hL_PoolMap, hPoolMapEdit, hL_Wep, hWepEdit, hOutEdit})
+        for (HWND h : {hHintLabel, hCharLabel, hCharEdit, hPoolMapLabel, hPoolMapEdit,
+                       hWepLabel, hWepEdit, hOutEdit})
             SendMessage(h, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        // v0.1.4.0: 上面 CreateWindow 里那些坐标只是占位 —— 真正的位置一律由
+        //   LayoutChildren() 按当前客户区尺寸决定, 窗口每次缩放/滚动都会重算。
+        {
+            const Layout L = ComputeLayout(hwnd);
+            UpdateScrollInfo(hwnd, L);
+            LayoutChildren(hwnd, L);
+        }
         RebuildChartCache(hwnd);
+        break;
+    }
+    // v0.1.4.0: 窗口可缩放后, 尺寸一变就要重排控件 + 按新宽高重画图表。
+    //   图表行高/宽度都与客户区尺寸相关, 所以这里必须重建位图, 不能只 Invalidate。
+    //   重建 = 8 张 GDI+ 图重画, 拖动边框时每帧都会跑一次; 实测若觉得卡, 可以改成
+    //   WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE 期间只重排控件、松手后再重建图表。
+    case WM_SIZE: {
+        if (wParam == SIZE_MINIMIZED) break;      // 最小化时客户区为 0, 没必要折腾
+        const Layout L = ComputeLayout(hwnd);
+        if (L.clientW <= 0 || L.clientH <= 0) break;
+        // WM_SIZE 会以【相同尺寸】重复到达 (例如 SetScrollInfo 改变滚动条状态之后),
+        // 尺寸没变就没必要重画 8 张图。
+        static int s_lastW = -1, s_lastH = -1;
+        const bool sizeChanged = (L.clientW != s_lastW || L.clientH != s_lastH);
+        s_lastW = L.clientW; s_lastH = L.clientH;
+
+        const int maxScroll = (std::max)(0, L.contentH - L.clientH);
+        if (g_scrollY > maxScroll) g_scrollY = maxScroll;   // 窗口变高时把内容拉回来
+        UpdateScrollInfo(hwnd, L);
+        LayoutChildren(hwnd, L);
+        if (sizeChanged) RebuildChartCache(hwnd);
+        InvalidateRect(hwnd, NULL, FALSE);
+        break;
+    }
+    // 限制最小尺寸: 再小图表就没有可读性了, 且极端窄高会让布局退化。
+    // g_dpi 在 CreateWindowW 之前就已设置好, 这里可以安全使用。
+    case WM_GETMINMAXINFO: {
+        auto* mmi = (MINMAXINFO*)lParam;
+        mmi->ptMinTrackSize.x = DPIScale(ui::kMinWindowW);
+        mmi->ptMinTrackSize.y = DPIScale(ui::kMinWindowH);
+        break;
+    }
+    case WM_VSCROLL: {
+        SCROLLINFO si = { sizeof(si) };
+        si.fMask = SIF_ALL;
+        if (!GetScrollInfo(hwnd, SB_VERT, &si)) break;
+        int pos = si.nPos;
+        const int line = DPIScale(ui::kScrollLine);
+        switch (LOWORD(wParam)) {
+        case SB_TOP:           pos  = si.nMin;          break;
+        case SB_BOTTOM:        pos  = si.nMax;          break;
+        case SB_LINEUP:        pos -= line;             break;
+        case SB_LINEDOWN:      pos += line;             break;
+        case SB_PAGEUP:        pos -= (int)si.nPage;    break;
+        case SB_PAGEDOWN:      pos += (int)si.nPage;    break;
+        // THUMBTRACK 用 nTrackPos 才能跟手 (nPos 在拖动过程中不更新)
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION: pos  = si.nTrackPos;     break;
+        default: break;
+        }
+        ScrollTo(hwnd, pos);
+        break;
+    }
+    // 滚轮: 一格滚三"行"。注意鼠标停在输出文本框上时消息会先给那个 RichEdit
+    // (它自带 WS_VSCROLL), 由它滚自己的内容 —— 与 Apple 版嵌套 ScrollView 行为一致。
+    case WM_MOUSEWHEEL: {
+        const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        ScrollTo(hwnd, g_scrollY - delta * DPIScale(ui::kScrollLine) * 3 / WHEEL_DELTA);
         break;
     }
     case WM_DROPFILES: {
@@ -2638,10 +3264,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_hChartBmp) {
             HDC hdcMem = CreateCompatibleDC(hdc);
             HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, g_hChartBmp);
+            // v0.1.4.0: 位图是内容坐标系的整幅图, 这里按当前滚动量偏移源点 Y 取一片。
+            //   滚动之所以廉价就在于此 —— 只是换个源点, 不重画任何图表。
             BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top,
                    ps.rcPaint.right - ps.rcPaint.left,
                    ps.rcPaint.bottom - ps.rcPaint.top,
-                   hdcMem, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+                   hdcMem, ps.rcPaint.left, ps.rcPaint.top + g_scrollY, SRCCOPY);
             SelectObject(hdcMem, hOld);
             DeleteDC(hdcMem);
         }
@@ -2707,12 +3335,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     wc.lpszClassName = L"EndfieldStatsClass";
     RegisterClassW(&wc);
 
-    DWORD dwStyle = (WS_OVERLAPPEDWINDOW ^ WS_THICKFRAME ^ WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
-    // 窗口尺寸:
-    //   高度 (v0.1.2.0): 900 → 1170, 容纳新增的辉光庆典图表行 (245 顶部空间 + 250 新图表 - 5 边距吸收)
+    // v0.1.4.0: 窗口改为【可缩放 + 可最大化 + 带垂直滚动条】。
+    //   此前为了保证图表布局不被破坏, 特意去掉了 WS_THICKFRAME / WS_MAXIMIZEBOX,
+    //   代价是窗口高度必须能装下全部内容 —— 加入第 4 行图表 (重构寻访) 后需要 1460px,
+    //   在 1080p 屏上底部会被截掉且无法滚动查看。
+    //   现在坐标全部由 ComputeLayout() 动态算出, 缩放安全; 装不下就滚动 (参考 Apple 版
+    //   macOS ContentView 把主区域套进 ScrollView 的做法)。
+    DWORD dwStyle = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VSCROLL;
+    // 初始窗口尺寸 (之后用户可以随意拖动):
     //   宽度 (v0.1.2.4): 1280 → 1260, 让左右留白对称 (内容右边界 x=1240, 左留白 20 → 右留白也 20).
-    //                   之前 1280 时右留白 40, 比左留白 20 多 20px, 视觉不平衡.
-    RECT rect = {0, 0, DPIScale(1260), DPIScale(1170)};
+    //   高度: 取 4 行图表都不压缩时的完整内容高 (1460), 但不超过工作区高度的 92% ——
+    //         这样 1440p/4K 上开箱即见全部内容, 1080p 上则自动开成能放下的高度,
+    //         底部内容用滚动条查看, 不会一启动就有一半在屏幕外。
+    RECT wa = {0};
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0)) {
+        wa.right = GetSystemMetrics(SM_CXSCREEN);
+        wa.bottom = GetSystemMetrics(SM_CYSCREEN);
+    }
+    const int waH = (std::max)(DPIScale(ui::kMinWindowH), (int)((wa.bottom - wa.top) * 92 / 100));
+    RECT rect = {0, 0, DPIScale(1260), (std::min)(DPIScale(1460), waH)};
     AdjustWindowRectEx(&rect, dwStyle, FALSE, 0);
 
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"终末地抽卡记录分析与可视化",

@@ -14,6 +14,15 @@ Gacha tracker and visualizer for Arknights: Endfield. Built with C++20 &amp; Win
 3. Run `gui.exe` (the analyzer) and drag `uigf_endfield.json` onto the window.
    运行用于分析与可视化抽卡数据的 `gui.exe` 图形界面程序，并将 `uigf_endfield.json` 拖拽到程序窗口中。
 
+> [!IMPORTANT]
+> The in-game headhunting record only covers **the last 90 days**. Records older than that are dropped
+> by the official API and can never be fetched again. `main.exe` merges each run into the existing
+> `uigf_endfield.json` incrementally, so run it regularly and keep that file — it is the only long-term
+> archive of your pulls.
+>
+> 游戏内【寻访记录】只支持查询**最近 90 天**的记录，更早的记录会被官方接口丢弃且无法再取回。
+> `main.exe` 是增量合并到已有的 `uigf_endfield.json` 的，所以请定期运行并保留该文件 —— 它是你抽卡历史的唯一长期存档。
+
 
 
 ## How to compile 如何编译
