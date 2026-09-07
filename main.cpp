@@ -112,8 +112,16 @@ inline std::string_view ExtractJsonValue(std::string_view source, std::string_vi
 // v0.1.3.3 (A2): 返回值改为 bool —— 是否定位到了 "arrayKey": [ ... ] 数组结构 (数组为空也算
 // 定位成功)。基底加载用它区分"结构正确的空数据"(正常, 0 条) 与"无结构的损坏/异类文件"
 // (中止, 防止覆盖原历史)。原有调用方不取返回值, 行为不变。
+//
+// v0.1.5.0: 增加可选出参 arrayClosed —— 数组是否【正常闭合】(扫到了 depth==0 的 ']')。
+//   仅靠返回值不足以判断文件完好: 文件若在数组中途被截断 (磁盘写满 / 进程被杀 / 手工编辑
+//   出错), 定位仍然成功、回调也会正常吐出前面那些完整对象, 函数照样返回 true ——
+//   调用方会以为读全了, 然后把"读到的那部分"写回去, 把尾巴永久抹掉。
+//   基底加载据此在截断时中止, 不覆盖原文件。老调用方不传该参数, 行为不变。
 template<typename Callback>
-bool ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callback&& cb) {
+bool ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callback&& cb,
+                       bool* arrayClosed = nullptr) {
+    if (arrayClosed) *arrayClosed = false;
     size_t pos = FindJsonKey(source, arrayKey);
     if (pos == std::string_view::npos) return false;
     pos = source.find(':', pos + arrayKey.length() + 2);
@@ -140,6 +148,7 @@ bool ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callb
             --depth;
             if (depth == 0) cb(source.substr(objStart, i - objStart + 1));
         } else if (c == ']' && depth == 0) {
+            if (arrayClosed) *arrayClosed = true;   // 走到这里才算完整读完
             break;
         }
     }
@@ -480,7 +489,13 @@ int main() {
     // 0 字节 / 映射失败 / 找不到 "list" 数组结构 = 按损坏处理, 中止且不写盘, 防止运行
     // 结束时 MoveFileEx 覆盖原历史; "list" 数组存在但为空 = 结构正确的空数据, 0 条正常继续。
     bool baseFileExists = false;   // 文件存在 (无论能否读)
-    bool baseLoadOk     = false;   // 打开 + 映射 + 结构 ("list" 数组) 三关全过
+    bool baseLoadOk     = false;   // 打开 + 映射 + 结构 ("list" 数组完整闭合) 三关全过
+    // v0.1.5.0 存档保护: 事件区读坏了同样必须中止, 不能"读不懂就当没有"然后覆盖。
+    //   eventsCorrupt 为真 = 文件里【有】non_pull_events 键, 但数组没闭合 (截断) 或存在
+    //   无法解析的条目。此时原文件里那些事件是唯一的副本 —— 抽卡记录接口只保留 90 天,
+    //   一旦被覆盖就永久丢失。
+    bool   eventsCorrupt  = false;
+    size_t eventsMalformed = 0;
     {
         FileHandle hFile;
         hFile.h = CreateFileA(uigfFilename.c_str(), GENERIC_READ,
@@ -520,6 +535,7 @@ int main() {
                             bufferView.remove_prefix(3);
                         }
 
+                        bool listClosed = false;
                         baseLoadOk = ForEachJsonObject(bufferView, "list", [&](std::string_view itemStr) {
                             std::string_view raw_id = ExtractJsonValue(itemStr, "id", true);
                             long long parsed_id = 0, parsed_ts = 0;
@@ -579,7 +595,10 @@ int main() {
                                 (uint8_t)(ExtractJsonValue(itemStr, "is_free", false) == "true" ? 1 : 0)
                             });
                             local_safe_ids.insert(parsed_id);
-                        });
+                        }, &listClosed);
+                        // 数组没闭合 = 文件被截断。此前只要能定位到 "list" 就算加载成功,
+                        // 于是"读到的那部分"会被当成完整历史写回去, 把尾巴永久抹掉。
+                        if (!listClosed) baseLoadOk = false;
 
                         // 非抽卡事件的往返读取。旧版文件没有这个键, ForEachJsonObject
                         // 直接返回 false, 这里不关心返回值 —— 缺失 = 0 条, 属正常情况,
@@ -588,10 +607,12 @@ int main() {
                         // 包装对象的形状是 { "id", "gacha_ts", "raw": {服务器原始对象} }。
                         // "id" / "gacha_ts" 写在 "raw" 之前, 而 FindJsonKey 取的是首个匹配,
                         // 所以即便将来某个 kind 的原始对象里也有同名键, 也不会被读串。
-                        ForEachJsonObject(bufferView, "non_pull_events", [&](std::string_view evtStr) {
+                        bool eventsClosed = false;
+                        const bool eventsKeyFound =
+                            ForEachJsonObject(bufferView, "non_pull_events", [&](std::string_view evtStr) {
                             NonPullEvent ev;
                             std::string_view idStr = ExtractJsonValue(evtStr, "id", true);
-                            if (idStr.empty()) return;
+                            if (idStr.empty()) { ++eventsMalformed; return; }
                             std::from_chars(idStr.data(), idStr.data() + idStr.size(), ev.safe_id);
                             std::string_view tsStr = ExtractJsonValue(evtStr, "gacha_ts", true);
                             if (!tsStr.empty()) {
@@ -622,10 +643,17 @@ int main() {
                                     }
                                 }
                             }
-                            if (ev.raw.empty()) return;      // 结构异常的条目直接丢弃, 不回写
+                            // 取不出 raw = 该条目结构异常。不能悄悄跳过 —— 跳过之后写盘
+                            // 就等于把它删了。计数, 由下面统一升级为"中止, 不写盘"。
+                            if (ev.raw.empty()) { ++eventsMalformed; return; }
                             events.push_back(ev);
                             local_safe_ids.insert(ev.safe_id);
-                        });
+                        }, &eventsClosed);
+                        // 键不存在 = 旧格式文件, 正常继续 (0 条事件)。
+                        // 键存在但没闭合 (截断) 或有条目解析不了 = 存档受损, 必须中止。
+                        if (eventsKeyFound && (!eventsClosed || eventsMalformed > 0)) {
+                            eventsCorrupt = true;
+                        }
                     }
                 }
             }
@@ -649,9 +677,29 @@ int main() {
     }  // <- Guard 全部析构,文件完全释放
 
     if (baseFileExists && !baseLoadOk) {
-        printf("[错误] 本地记录文件 %s 存在, 但无法读取或不含 \"list\" 数组结构\n", uigfFilename.c_str());
+        printf("[错误] 本地记录文件 %s 存在, 但无法读取、不含 \"list\" 数组结构,\n", uigfFilename.c_str());
+        printf("       或该数组在中途被截断 (未正常闭合)。\n");
         printf("       (0 字节、被占用、已损坏或非本工具格式)。\n");
         printf("       为防止本次运行结束时覆盖原有历史, 已中止。请检查或移走该文件后重试。\n");
+        system("pause");
+        return 1;
+    }
+
+    // v0.1.5.0: 事件区受损与 list 受损同等对待 —— 都中止, 都不写盘。
+    //   "读不懂就当没有"在这里是危险的默认: 抽卡记录接口只保留最近 90 天, 本地文件是
+    //   这些事件的唯一副本, 一旦按"读到的部分"覆盖回去, 读不出来的那些就永久没了。
+    //   宁可让用户看到报错去处理, 也不要静默地少写一段。
+    if (eventsCorrupt) {
+        printf("[错误] 本地记录文件 %s 的 \"non_pull_events\" 段已损坏:\n", uigfFilename.c_str());
+        if (eventsMalformed > 0) {
+            printf("       有 %zu 条事件缺少 id 或 raw 字段而无法解析。\n", eventsMalformed);
+        } else {
+            printf("       该数组在中途被截断 (未正常闭合)。\n");
+        }
+        printf("       这些事件在本地文件之外没有副本 (接口只保留最近 90 天),\n");
+        printf("       若照常写盘会把读不出来的那部分永久删除, 故已中止、原文件保持原样。\n");
+        printf("       请修复或移走该文件后重试; 若确认可以放弃这些事件, 手工删掉\n");
+        printf("       \"non_pull_events\" 整段再运行即可 (抽卡记录不受影响)。\n");
         system("pause");
         return 1;
     }
