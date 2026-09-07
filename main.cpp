@@ -108,51 +108,202 @@ inline std::string_view ExtractJsonValue(std::string_view source, std::string_vi
     }
 }
 
+// ---- 顶层字段读取 (v0.1.5.0) ----
+// ExtractJsonValue / FindJsonKey 都是"全文找首个同名键"的粗放做法: 只要键名在别处
+// 出现过 (哪怕是在嵌套对象里、或在别的字段的字符串值里), 就可能读串。对付服务器
+// 返回的临时报文够用, 但读【自己写的存档】时不行 —— 读串一条就意味着写盘时把原始
+// 数据换成了别的东西, 而抽卡接口只保留 90 天, 原件没有第二份。
+// 下面这组函数只认【当前对象本层】的键, 并且把值的类型一并带出来, 供调用方校验。
+enum class JsonValueKind : uint8_t { None = 0, String, Number, Object, Array, Bool, Null };
+
+struct JsonValueRef {
+    JsonValueKind kind = JsonValueKind::None;
+    std::string_view text;   // String: 去掉两端引号的原文(转义未还原); 其余: 值的原文
+};
+
+// 从 s[i] 处解析一个 JSON 值, 返回其结束位置(末字符的下一位); 结构不合法返回 npos。
+// 括号用位栈严格配对 —— '[' 记 1、'{' 记 0, 闭合时比对, 交叉括号(如 {..])直接判非法。
+inline size_t SkipJsonValue(std::string_view s, size_t i, JsonValueKind& kind) {
+    const size_t n = s.size();
+    while (i < n && (unsigned char)s[i] <= ' ') ++i;
+    if (i >= n) return std::string_view::npos;
+    const char c = s[i];
+    if (c == '"') {
+        for (size_t k = i + 1; k < n; ++k) {
+            if (s[k] == '\\') { ++k; continue; }
+            if (s[k] == '"') { kind = JsonValueKind::String; return k + 1; }
+        }
+        return std::string_view::npos;          // 字符串没闭合
+    }
+    if (c == '{' || c == '[') {
+        uint64_t isArr = 0;                     // bit d: 第 d 层是 '[' 吗
+        int depth = 0;
+        for (size_t k = i; k < n; ++k) {
+            const char d = s[k];
+            if (d == '"') {
+                size_t q = k + 1;
+                for (; q < n; ++q) {
+                    if (s[q] == '\\') { ++q; continue; }
+                    if (s[q] == '"') break;
+                }
+                if (q >= n) return std::string_view::npos;
+                k = q;
+                continue;
+            }
+            if (d == '{' || d == '[') {
+                if (depth >= 64) return std::string_view::npos;   // 嵌套过深, 不冒险
+                if (d == '[') isArr |= (1ull << depth); else isArr &= ~(1ull << depth);
+                ++depth;
+            } else if (d == '}' || d == ']') {
+                if (depth == 0) return std::string_view::npos;
+                --depth;
+                const bool wantArr = ((isArr >> depth) & 1ull) != 0;
+                if (wantArr != (d == ']')) return std::string_view::npos;   // 括号交叉
+                if (depth == 0) {
+                    kind = wantArr ? JsonValueKind::Array : JsonValueKind::Object;
+                    return k + 1;
+                }
+            }
+        }
+        return std::string_view::npos;          // 没闭合 = 被截断
+    }
+    size_t k = i;
+    while (k < n && s[k] != ',' && s[k] != '}' && s[k] != ']' && (unsigned char)s[k] > ' ') ++k;
+    if (k == i) return std::string_view::npos;
+    const std::string_view lit = s.substr(i, k - i);
+    kind = (lit == "true" || lit == "false") ? JsonValueKind::Bool
+         : (lit == "null")                   ? JsonValueKind::Null
+                                             : JsonValueKind::Number;
+    return k;
+}
+
+// 在【对象 obj 的本层】查找 key。obj 必须是以 '{' 开头的完整对象。
+// 找不到返回 kind == None; 结构不合法同样返回 None (调用方按"缺失"处理即可 —— 缺失和
+// 读不出来在存档场景里都会被上层升级成"中止, 不写盘")。
+inline JsonValueRef FindTopLevelValue(std::string_view obj, std::string_view key) {
+    JsonValueRef out;
+    const size_t n = obj.size();
+    size_t i = 0;
+    while (i < n && (unsigned char)obj[i] <= ' ') ++i;
+    if (i >= n || obj[i] != '{') return out;
+    ++i;
+    while (true) {
+        while (i < n && (unsigned char)obj[i] <= ' ') ++i;
+        if (i >= n || obj[i] == '}') return out;
+        if (obj[i] == ',') { ++i; continue; }
+        if (obj[i] != '"') return out;                   // 键必须是字符串
+        const size_t ks = i + 1;
+        size_t ke = ks;
+        bool escaped = false;
+        while (ke < n) {
+            if (obj[ke] == '\\') { ke += 2; escaped = true; continue; }
+            if (obj[ke] == '"') break;
+            ++ke;
+        }
+        if (ke >= n) return out;
+        const std::string_view thisKey = obj.substr(ks, ke - ks);
+        i = ke + 1;
+        while (i < n && (unsigned char)obj[i] <= ' ') ++i;
+        if (i >= n || obj[i] != ':') return out;
+        ++i;
+        while (i < n && (unsigned char)obj[i] <= ' ') ++i;
+        const size_t vs = i;
+        JsonValueKind vk = JsonValueKind::None;
+        const size_t ve = SkipJsonValue(obj, i, vk);
+        if (ve == std::string_view::npos) return out;
+        // escaped 的键名不做还原, 直接跳过 —— 我们要找的键都是纯 ASCII
+        if (!escaped && thisKey == key) {
+            out.kind = vk;
+            out.text = (vk == JsonValueKind::String) ? obj.substr(vs + 1, (ve - 1) - (vs + 1))
+                                                     : obj.substr(vs, ve - vs);
+            return out;
+        }
+        i = ve;
+    }
+}
+
+// 整串必须是一个完整的十进制整数 —— from_chars 只报"读到了几个字符", 不检查就会把
+// "bad-id" 读成 0、"1006oops" 读成 1006, 于是坏数据被当成好数据落盘。
+inline bool ParseFullInt64(std::string_view s, long long& out) {
+    if (s.empty()) return false;
+    const char* const first = s.data();
+    const char* const last  = s.data() + s.size();
+    long long v = 0;
+    const auto res = std::from_chars(first, last, v);
+    if (res.ec != std::errc{} || res.ptr != last) return false;
+    out = v;
+    return true;
+}
+
 // O(N) 逐字符扫描。
-// v0.1.3.3 (A2): 返回值改为 bool —— 是否定位到了 "arrayKey": [ ... ] 数组结构 (数组为空也算
-// 定位成功)。基底加载用它区分"结构正确的空数据"(正常, 0 条) 与"无结构的损坏/异类文件"
-// (中止, 防止覆盖原历史)。原有调用方不取返回值, 行为不变。
+// v0.1.3.3 (A2): 能否定位到 "arrayKey": [ ... ] 数组结构 (数组为空也算定位成功)。基底加载
+// 用它区分"结构正确的空数据"(正常, 0 条) 与"无结构的损坏/异类文件"(中止, 防止覆盖原历史)。
 //
-// v0.1.5.0: 增加可选出参 arrayClosed —— 数组是否【正常闭合】(扫到了 depth==0 的 ']')。
-//   仅靠返回值不足以判断文件完好: 文件若在数组中途被截断 (磁盘写满 / 进程被杀 / 手工编辑
-//   出错), 定位仍然成功、回调也会正常吐出前面那些完整对象, 函数照样返回 true ——
-//   调用方会以为读全了, 然后把"读到的那部分"写回去, 把尾巴永久抹掉。
-//   基底加载据此在截断时中止, 不覆盖原文件。老调用方不传该参数, 行为不变。
+// v0.1.5.0: 返回值从 bool 升级为三态 —— 只有"有没有找到"是不够的:
+//   * 键存在但值不是数组 ("non_pull_events": { ... }), 或文件正好在 ':' 后被截断 ——
+//     旧版靠 source.find('[', pos) 无界前搜, 要么找不到而返回 false, 要么跳到文件后面
+//     某个不相干的数组上。返回 false 被上层理解为"旧格式文件, 没有这个键", 于是整段
+//     数据被静默丢弃并在写盘时抹掉。
+//   * 数组里混进了非对象元素 ("non_pull_events": [[], {...}]) —— 旧版只数花括号深度,
+//     内层那个 ']' 在 depth==0 上被当成数组结束, 后面真正的事件一条都读不到, 却报告
+//     "已正常闭合"。
+//   现在: 值必须【紧接着】是 '['、元素必须逐个是对象、必须扫到 depth==0 的 ']' 收尾,
+//   任一条不满足都返回 Malformed, 由调用方升级为"中止, 不写盘"。
+enum class JsonArrayScan : uint8_t {
+    NotFound = 0,   // 没有这个键 (旧格式文件, 正常)
+    Ok,             // 键存在, 值是正常闭合的数组, 元素全是对象 (可以是 0 个)
+    Malformed       // 键存在, 但值不是数组 / 数组被截断 / 元素不是对象
+};
+
 template<typename Callback>
-bool ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callback&& cb,
-                       bool* arrayClosed = nullptr) {
-    if (arrayClosed) *arrayClosed = false;
-    size_t pos = FindJsonKey(source, arrayKey);
-    if (pos == std::string_view::npos) return false;
-    pos = source.find(':', pos + arrayKey.length() + 2);
-    if (pos == std::string_view::npos) return false;
-    pos = source.find('[', pos);
-    if (pos == std::string_view::npos) return false;
+JsonArrayScan ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callback&& cb) {
+    const size_t len = source.length();
+    size_t pos = 0;
+    for (size_t search = 0; ; ) {
+        const size_t hit = FindJsonKey(source, arrayKey, search);
+        if (hit == std::string_view::npos) return JsonArrayScan::NotFound;
+        size_t p = hit + arrayKey.length() + 2; // FindJsonKey 返回起始引号, 跳过 "key"
+        search = p;
+        while (p < len && (unsigned char)source[p] <= ' ') ++p;
+        // FindJsonKey 只认"两侧带引号", 值恰好等于键名时 ("foo":"list") 也会命中。
+        // 后面不是 ':' 就说明这不是个键, 换下一处继续找, 而不是判文件损坏。
+        if (p >= len || source[p] != ':') continue;
+        ++p;
+        while (p < len && (unsigned char)source[p] <= ' ') ++p;
+        // 是键, 但值不【紧接着】是 '[' —— 这才是真的坏了。
+        if (p >= len || source[p] != '[') return JsonArrayScan::Malformed;
+        pos = p;
+        break;
+    }
 
     int depth = 0;
     size_t objStart = 0;
-    const size_t len = source.length();
-    for (size_t i = pos; i < len; ++i) {
-        char c = source[i];
-        if (c == '"') {
-            for (++i; i < len; ++i) {
-                if (source[i] == '\\' && i + 1 < len) { ++i; continue; }
-                if (source[i] == '"') break;
-            }
+    for (size_t i = pos + 1; i < len; ++i) {
+        const char c = source[i];
+        if (depth == 0) {                       // 数组本层: 只允许空白 / ',' / 对象 / ']'
+            if ((unsigned char)c <= ' ' || c == ',') continue;
+            if (c == ']') return JsonArrayScan::Ok;
+            if (c != '{') return JsonArrayScan::Malformed;
+            objStart = i;
+            depth = 1;
             continue;
         }
-        if (c == '{') {
-            if (depth == 0) objStart = i;
-            ++depth;
-        } else if (c == '}') {
-            --depth;
-            if (depth == 0) cb(source.substr(objStart, i - objStart + 1));
-        } else if (c == ']' && depth == 0) {
-            if (arrayClosed) *arrayClosed = true;   // 走到这里才算完整读完
-            break;
+        if (c == '"') {                         // 跳过字符串, 里面的花括号不计深度
+            size_t k = i + 1;
+            for (; k < len; ++k) {
+                if (source[k] == '\\') { ++k; continue; }
+                if (source[k] == '"') break;
+            }
+            if (k >= len) return JsonArrayScan::Malformed;   // 字符串没闭合 = 被截断
+            i = k;
+            continue;
+        }
+        if (c == '{') ++depth;
+        else if (c == '}') {
+            if (--depth == 0) cb(source.substr(objStart, i - objStart + 1));
         }
     }
-    return true;   // 已定位数组 (即便其中 0 个对象)
+    return JsonArrayScan::Malformed;            // 扫到结尾也没等到 ']' = 被截断
 }
 
 inline std::wstring Utf8ToWstring(std::string_view str) {
@@ -495,6 +646,7 @@ int main() {
     //   无法解析的条目。此时原文件里那些事件是唯一的副本 —— 抽卡记录接口只保留 90 天,
     //   一旦被覆盖就永久丢失。
     bool   eventsCorrupt  = false;
+    bool   eventsBadShape = false;   // 键在, 但值不是一个正常闭合、元素全为对象的数组
     size_t eventsMalformed = 0;
     {
         FileHandle hFile;
@@ -535,7 +687,6 @@ int main() {
                             bufferView.remove_prefix(3);
                         }
 
-                        bool listClosed = false;
                         baseLoadOk = ForEachJsonObject(bufferView, "list", [&](std::string_view itemStr) {
                             std::string_view raw_id = ExtractJsonValue(itemStr, "id", true);
                             long long parsed_id = 0, parsed_ts = 0;
@@ -595,63 +746,49 @@ int main() {
                                 (uint8_t)(ExtractJsonValue(itemStr, "is_free", false) == "true" ? 1 : 0)
                             });
                             local_safe_ids.insert(parsed_id);
-                        }, &listClosed);
-                        // 数组没闭合 = 文件被截断。此前只要能定位到 "list" 就算加载成功,
-                        // 于是"读到的那部分"会被当成完整历史写回去, 把尾巴永久抹掉。
-                        if (!listClosed) baseLoadOk = false;
+                        }) == JsonArrayScan::Ok;
+                        // Ok 之外的一切 (没这个键 / 值不是数组 / 数组没闭合 / 元素不是对象)
+                        // 都判加载失败。此前只要能定位到 "list" 就算加载成功, 于是被截断的
+                        // 文件里"读到的那部分"会被当成完整历史写回去, 把尾巴永久抹掉。
 
                         // 非抽卡事件的往返读取。旧版文件没有这个键, ForEachJsonObject
-                        // 直接返回 false, 这里不关心返回值 —— 缺失 = 0 条, 属正常情况,
-                        // 不能影响 baseLoadOk (那是"文件是否可用"的判据, 只看 "list")。
+                        // 返回 NotFound —— 缺失 = 0 条, 属正常情况, 不能影响 baseLoadOk
+                        // (那是"文件是否可用"的判据, 只看 "list")。但 Malformed 必须中止:
+                        // 键在那儿而读不出来, 意味着这一段是坏的, 不是不存在。
                         //
                         // 包装对象的形状是 { "id", "gacha_ts", "raw": {服务器原始对象} }。
-                        // "id" / "gacha_ts" 写在 "raw" 之前, 而 FindJsonKey 取的是首个匹配,
-                        // 所以即便将来某个 kind 的原始对象里也有同名键, 也不会被读串。
-                        bool eventsClosed = false;
-                        const bool eventsKeyFound =
+                        // 三个字段一律【按本层键】读取: raw 里是服务器原样透传的对象, 里面
+                        // 完全可能出现同名的 id / gacha_ts, 而 raw 自身的值也未必真是对象
+                        // (文件被别的工具改过、或人工编辑坏了)。用全文找首个匹配的老办法,
+                        // 上述任一情况都会读到别的东西, 然后当成好数据落盘。
+                        const JsonArrayScan eventsScan =
                             ForEachJsonObject(bufferView, "non_pull_events", [&](std::string_view evtStr) {
                             NonPullEvent ev;
-                            std::string_view idStr = ExtractJsonValue(evtStr, "id", true);
-                            if (idStr.empty()) { ++eventsMalformed; return; }
-                            std::from_chars(idStr.data(), idStr.data() + idStr.size(), ev.safe_id);
-                            std::string_view tsStr = ExtractJsonValue(evtStr, "gacha_ts", true);
-                            if (!tsStr.empty()) {
-                                std::from_chars(tsStr.data(), tsStr.data() + tsStr.size(), ev.timestamp);
+                            // id: 必须有, 必须是字符串或数字, 且整串都是一个完整的整数。
+                            const JsonValueRef idV = FindTopLevelValue(evtStr, "id");
+                            if ((idV.kind != JsonValueKind::String && idV.kind != JsonValueKind::Number) ||
+                                !ParseFullInt64(idV.text, ev.safe_id)) { ++eventsMalformed; return; }
+                            // gacha_ts: 允许缺失 (老写法留下的条目), 但写了就必须能解析。
+                            const JsonValueRef tsV = FindTopLevelValue(evtStr, "gacha_ts");
+                            if (tsV.kind == JsonValueKind::String || tsV.kind == JsonValueKind::Number) {
+                                if (!ParseFullInt64(tsV.text, ev.timestamp)) { ++eventsMalformed; return; }
+                            } else if (tsV.kind != JsonValueKind::None) {
+                                ++eventsMalformed; return;
                             }
-                            // 取出 "raw" 后面那个完整对象 (含大括号), 原样留存
-                            size_t rawPos = FindJsonKey(evtStr, "raw");
-                            if (rawPos != std::string_view::npos) {
-                                size_t braceOpen = evtStr.find('{', rawPos);
-                                if (braceOpen != std::string_view::npos) {
-                                    int depth = 0;
-                                    for (size_t k = braceOpen; k < evtStr.size(); ++k) {
-                                        char c = evtStr[k];
-                                        if (c == '"') {   // 跳过字符串, 里面的花括号不计深度
-                                            for (++k; k < evtStr.size(); ++k) {
-                                                if (evtStr[k] == '\\' && k + 1 < evtStr.size()) { ++k; continue; }
-                                                if (evtStr[k] == '"') break;
-                                            }
-                                            continue;
-                                        }
-                                        if (c == '{') ++depth;
-                                        else if (c == '}') {
-                                            if (--depth == 0) {
-                                                ev.raw = evtStr.substr(braceOpen, k - braceOpen + 1);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            // 取不出 raw = 该条目结构异常。不能悄悄跳过 —— 跳过之后写盘
-                            // 就等于把它删了。计数, 由下面统一升级为"中止, 不写盘"。
-                            if (ev.raw.empty()) { ++eventsMalformed; return; }
+                            // raw: 必须是对象, 原样留存 (含大括号)。取不出 = 该条目结构异常,
+                            // 不能悄悄跳过 —— 跳过之后写盘就等于把它删了。计数, 由下面统一
+                            // 升级为"中止, 不写盘"。
+                            const JsonValueRef rawV = FindTopLevelValue(evtStr, "raw");
+                            if (rawV.kind != JsonValueKind::Object) { ++eventsMalformed; return; }
+                            ev.raw = rawV.text;
                             events.push_back(ev);
                             local_safe_ids.insert(ev.safe_id);
-                        }, &eventsClosed);
-                        // 键不存在 = 旧格式文件, 正常继续 (0 条事件)。
-                        // 键存在但没闭合 (截断) 或有条目解析不了 = 存档受损, 必须中止。
-                        if (eventsKeyFound && (!eventsClosed || eventsMalformed > 0)) {
+                        });
+                        // NotFound = 旧格式文件, 正常继续 (0 条事件)。
+                        // Malformed (值不是数组 / 数组被截断 / 元素不是对象) 或有条目解析
+                        // 不了 = 存档受损, 必须中止。
+                        eventsBadShape = (eventsScan == JsonArrayScan::Malformed);
+                        if (eventsBadShape || (eventsScan == JsonArrayScan::Ok && eventsMalformed > 0)) {
                             eventsCorrupt = true;
                         }
                     }
@@ -691,10 +828,13 @@ int main() {
     //   宁可让用户看到报错去处理, 也不要静默地少写一段。
     if (eventsCorrupt) {
         printf("[错误] 本地记录文件 %s 的 \"non_pull_events\" 段已损坏:\n", uigfFilename.c_str());
+        if (eventsBadShape) {
+            printf("       该键的值不是一个正常闭合的对象数组 (被截断、写成了别的类型,\n");
+            printf("       或数组里混进了非对象元素)。\n");
+        }
         if (eventsMalformed > 0) {
-            printf("       有 %zu 条事件缺少 id 或 raw 字段而无法解析。\n", eventsMalformed);
-        } else {
-            printf("       该数组在中途被截断 (未正常闭合)。\n");
+            printf("       有 %zu 条事件的 id / gacha_ts / raw 字段缺失或类型不对而无法解析。\n",
+                   eventsMalformed);
         }
         printf("       这些事件在本地文件之外没有副本 (接口只保留最近 90 天),\n");
         printf("       若照常写盘会把读不出来的那部分永久删除, 故已中止、原文件保持原样。\n");
