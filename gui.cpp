@@ -1117,10 +1117,12 @@ inline double SampleVariance(long long sum, long long sum_sq, int n) {
 // isRefactor 参数 (v0.1.4.0 新增, 重构寻访 RE-Factor):
 //   - 池中六星 = 当期 UP + 5 名常驻 (无往期限定滞留), 所以 pool_map 与常驻排除法
 //     两条路径都能正确判 UP; 与 Special 一样走 pool_map 优先。
-//   - 80 抽小保底【所有重构寻访之间共享继承】→ 不按期重置 (track_banner = false)
-//   - 120 抽 UP 保底【同名系列一生仅生效 1 次】且计数跨期继承 → got_up_banner 不重置,
-//     天然等价于"整个系列只触发一次"
-//   - 赠送十连有 3 处 (累计 30/60/90 抽), 而非特许寻访的 1 处
+//   - 80 抽小保底【所有重构寻访之间共享继承】→ current_pity 全局共享, 不按期重置
+//     (track_banner = false)
+//   - 120 抽 UP 保底 / 累计奖励 / 未使用的加急招募【只在同名系列内继承, 且兜底一生仅
+//     生效 1 次】→ 这三样按 pool_name 存进 series_states, 离开某系列再回来能接上进度。
+//     不能用"换池就清零"来近似: 那样 A→B→A 时 A 的进度会丢 (见 series_states 处说明)。
+//   - 赠送十连有 3 处 (累计 30/60/90 抽), 而非特许寻访的 1 处; 计数同样按系列独立
 //   官方规则原文: https://endfield.hypergryph.com/news/4776
 // -------------------------------------------------------
 StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
@@ -1158,7 +1160,26 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     //   已知局限: 抽卡记录只保留最近 90 天, 历史被截断时第一块可能只剩半截, 会让后续
     //   块序号整体偏移。无法从记录本身分辨, 故不做补偿 —— 影响仅限赠送出货落在哪个
     //   理论节点, 不影响出货计数与胜负统计。
-    int free_pull_count = 0;
+    int free_pull_count = 0;                       // 非重构池用 (恒为节点 30, 实际不参与计算)
+
+    // 重构寻访的【按系列保存】状态 (v0.1.4.0)。
+    //   官方两个作用域不同:
+    //     - 80 抽六星保底: 「所有『重构寻访』共享」→ current_pity 全局共享, 不进本表
+    //     - 120 抽首个 UP 保底 / 累计奖励 / 未使用的加急招募:
+    //       「在【同名】重构寻访中仅生效 1 次 / 将保留到后续【同名】重构寻访中」
+    //       → 每个系列各自一份, 离开再回来要能接上
+    //   早先的写法是"pool_name 变了就把 UP 侧清零", 那只能处理 A→B, 处理不了
+    //   A→B→A: 回到 A 时 A 的进度已经被抹掉, 会把本该是第 120 抽的首个 UP 记成第 60 抽,
+    //   也会把已经用掉的兜底额度错误地"还"给 A。而且这【不需要两个系列同时开放】,
+    //   依次经历 A 第一期 → B 第一期 → A 第二期就会发生。
+    //   系列标识用 pool_name: 同名系列的 #1/#2/#3 共用一个 pool_name, 不同系列名字不同。
+    struct SeriesState {
+        int  pity_up    = 0;      // 距该系列上一个 UP 的抽数 (即 120 兜底的计数)
+        int  free_count = 0;      // 该系列已用掉的赠送十连条数 (决定 30/60/90 节点)
+        bool got_up     = false;  // 该系列的 120 兜底额度是否已被本体抽消耗
+    };
+    std::unordered_map<std::string_view, SeriesState> series_states;
+    SeriesState* last_series = nullptr;   // 收尾算右删失时用最后活动的那个系列
 
     // 第30抽赠送十连处理 (依据《明日方舟终末地抽卡机制解析》2.1.1):
     //   - "该十连享有基础概率(0.008),但不占用也不增加保底进度"
@@ -1172,26 +1193,30 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     for (size_t i = 0; i < total; ++i) {
         const bool isFree = bucket.is_free[i];
 
+        // 重构池: 按 pool_name 取出该系列自己的状态 (不存在则默认构造 = 全新系列)。
+        //   unordered_map 是节点式容器, 插入新键不会让已取得的引用失效。
+        //   非重构池仍用函数级的单份状态, 行为与既有版本完全一致。
+        SeriesState* ss = nullptr;
+        if (isRefactor) {
+            ss = &series_states[bucket.poolNames[i]];
+            last_series = ss;
+        }
+        int&  up_pity   = isRefactor ? ss->pity_up    : pity_since_last_up;
+        bool& up_gotten = isRefactor ? ss->got_up     : got_up_banner;
+        int&  free_cnt  = isRefactor ? ss->free_count : free_pull_count;
+
         // 本条若是赠送十连, 先算出它属于第几块 (1-based), 再累加计数
         int free_block_idx = 0;
-        if (isFree) free_block_idx = (free_pull_count++ / 10) + 1;
+        if (isFree) free_block_idx = (free_cnt++ / 10) + 1;
 
         // 卡池边界探测: 读分桶阶段预计算的字节标记 (v0.1.3.2), 不再在热路径 memcmp 池名。
         //   starts_new_banner[i] = (本条 poolName 与上一条不同); 首条恒为 0 → 已含原 i>0 守卫。
         //   特许池: 120 硬保底不继承 → pity_since_last_up + got_up_banner 清零; 80 小保底继承 (current_pity 不动)
         //   武器池: 40 + 80 都不继承 → current_pity + pity_since_last_up + got_up_banner 全清零
-        // 重构寻访 (v0.1.4.0): 官方给的两个作用域【不同】——
-        //   80 抽六星保底: 「所有『重构寻访』共享此项保底机制…继承到其他『重构寻访』中」
-        //     ⇒ current_pity 跨所有重构池连续累加, 永不按期清零。
-        //   120 抽首个 UP 保底 / 累计奖励: 「该规则在【同名】重构寻访中仅生效 1 次,
-        //     该计数将继承到后续的【同名】重构寻访中」
-        //     ⇒ 只在【换到另一个系列】时才重置, 同名系列的 #1/#2/#3 之间继承。
-        //   数据里同名系列的各期共用同一个 pool_name (与特许池"每期一个新池名"不同),
-        //   所以 starts_new_banner (= pool_name 变化) 恰好就是"换系列"的判据。
-        //   已知局限: 若将来两个重构系列【同时开放】, 记录按时间交错, pool_name 会来回
-        //   跳变而产生误重置 —— 与武器池多期并行是同一类结构性问题, 待真实数据出现后
-        //   改成按系列分桶再解决。
-        if ((track_banner || isRefactor) && bucket.starts_new_banner[i]) {
+        // 重构池【不】走这里: 它的 UP 侧状态按系列存在 series_states 里, 换池只是换一份
+        //   状态, 不需要清零; current_pity 则跨所有重构池共享, 更不能清。
+        //   这样两个系列即使记录交错 (将来两个重构系列同时开放), 各自的计数也互不干扰。
+        if (track_banner && bucket.starts_new_banner[i]) {
             pity_since_last_up = 0;
             got_up_banner      = false;
             if (track_weapon) current_pity = 0;   // 武器 40 小保底也每期重算 (角色 80 小保底继承, 不清)
@@ -1200,7 +1225,7 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         // 赠送十连不推进保底通道
         if (!isFree) {
             ++current_pity;
-            ++pity_since_last_up;
+            ++up_pity;
         }
 
         // 非六星:likely 分支
@@ -1243,7 +1268,7 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         }
 
         if (isUP) {
-            const int slot_up = isFree ? free_node_up : pity_since_last_up;
+            const int slot_up = isFree ? free_node_up : up_pity;
             if (slot_up < 260) acc.freq_up[slot_up]++;
             if (slot_up > acc.max_pity_up) acc.max_pity_up = slot_up;
             acc.count_up++;
@@ -1258,11 +1283,11 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
             //   - 辉光庆典: 无硬保底, 每个限定直接计入。
             //   - avg_win (count_win/sum_win) 仅特许池有物理含义; 武器/Joint 不累计 (avg_win 保持 -1)。
             // 重构寻访虽然 track_banner=false (不按期重置), 但它【有】120 抽硬保底,
-            // 只是作用域是"同名系列一生一次" —— got_up_banner 在重构池永不重置,
-            // 恰好等价于该语义, 故这里把 isRefactor 一并放行。
+            // 只是作用域是"同名系列一生一次" —— up_gotten 对重构池取的是【该系列】的
+            // 状态且永不清零, 恰好等价于该语义, 故这里把 isRefactor 一并放行。
             const bool forced_by_hardpity =
-                (track_banner || isRefactor) && !got_up_banner && !isFree &&
-                pity_since_last_up >= hardpity_n;
+                (track_banner || isRefactor) && !up_gotten && !isFree &&
+                up_pity >= hardpity_n;
             if (isJoint) {
                 acc.win_5050++;                 // 辉光庆典无硬保底, 每个限定都是掷硬币结果
             } else if (!forced_by_hardpity) {
@@ -1278,8 +1303,8 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
             // (该问题在 main 上就存在, 不是重构池引入的: 旧写法无条件置 true, 会让免费出 UP
             //  之后那次真正由 120 硬保底强制出的 UP 被误算成一次随机"不歪", 抬高胜率。)
             if (!isFree) {
-                got_up_banner      = true;
-                pity_since_last_up = 0;   // 赠送十连出 UP 不重置水位 (独立通道)
+                up_gotten = true;
+                up_pity   = 0;   // 赠送十连出 UP 不重置水位 (独立通道)
             }
         } else {
             // 非 UP/非限定六星 = 一次独立判定的“负”。终末地可连续歪多次, 全部如实计入。
@@ -1292,7 +1317,10 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     // 右删失:遍历结束时若仍有未结算的 pity,记录为删失样本
     // 这些抽数"存活"到了 current_pity 抽仍未出 6 星(或 UP)
     acc.censored_pity_all = current_pity;
-    acc.censored_pity_up  = pity_since_last_up;
+    // 右删失的 UP 水位: 重构池取【最后活动的那个系列】的进度 (界面"当前垫刀"关心的是
+    //   玩家正在抽的那期), 其余池型仍用函数级的单份状态。
+    acc.censored_pity_up  = (isRefactor && last_series) ? last_series->pity_up
+                                                        : pity_since_last_up;
 
     // 防御性 clamp:即使数据异常导致 max_pity / censored_pity > 249,
     // 后续 ComputeKS 与 hazard 循环的索引访问也必须安全
@@ -1362,10 +1390,17 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         // v0.1.2.2: 辉光庆典走 g_cdf_joint_up (真实前向迭代, n=30 处展开免费十连)
         // 注意 isJoint 时 freq_up 的"事件"语义是"距上次限定的抽数", 与 g_cdf_joint_up
         // 描述的"首次非常驻六星"分布一致 (因为 pity_since_last_up 在每次出限定后重置)。
-        std::span<const double> cdf_up_tbl;              // v0.1.3.3: 长度由 span 自带
-        if (isWeapon)         cdf_up_tbl = g_cdf_wep_up;      // 81
-        else if (isJoint)     cdf_up_tbl = g_cdf_joint_up;    // 242
-        else if (isRefactor)  cdf_up_tbl = g_cdf_refactor_up; // 122
+        // ★ 选表必须是一条【完整闭合】的 if/else 链, 且后面不能再紧跟别的 if ——
+        //   v0.1.4.0 曾在这条链和它的 else 之间插进一个 if, 结果 else 改绑到了新 if 上,
+        //   武器池/辉光池/只有 1 个 UP 的重构池全部被覆盖成 g_cdf_char_up。编译无警告,
+        //   在真实数据上武器池的 D 值从 0.2603 被抬到 0.4241。之后若要在这里加逻辑,
+        //   请加在整条链【结束之后】, 并保持每个分支都带花括号。
+        std::span<const double> cdf_up_tbl;                     // v0.1.3.3: 长度由 span 自带
+        if      (isWeapon)   { cdf_up_tbl = g_cdf_wep_up;      }  // 81
+        else if (isJoint)    { cdf_up_tbl = g_cdf_joint_up;    }  // 242
+        else if (isRefactor) { cdf_up_tbl = g_cdf_refactor_up; }  // 122
+        else                 { cdf_up_tbl = g_cdf_char_up;     }  // 122
+
         // g_cdf_refactor_up 描述的是【系列内第一个 UP】的分布 —— 它在 n=120 强制收敛到 1,
         // 依据是「前120次寻访必定获取 UP, 该规则在同名重构寻访中仅生效 1 次」。
         // 而 freq_up 记的是每两个 UP 之间的间隔: 第 2 个及以后的 UP 已经没有这个兜底,
@@ -1373,8 +1408,7 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         // 整体就成了混合分布, 再拿这条曲线判"符合/偏离"就没有依据了。
         // 这不需要等到复刻才会发生 —— 首期追潜多抽一个 UP 就会遇到。
         // 故这里只标记, 由输出层把判定改成"样本混合"; D 值仍照常算出供参考。
-        if (isRefactor && acc.count_up > 1) s.ks_up_mixed = true;
-        else                  cdf_up_tbl = g_cdf_char_up;     // 122
+        s.ks_up_mixed = (isRefactor && acc.count_up > 1);
         if (isWeapon) {
             // v0.1.3.3 武器 UP K-S: 先把经验 freq_up 按申领 (10 抽) 粒度向上聚合再比较。
             // 原因: g_cdf_wep_up 的质量只在 10 倍数边界记账 (申领内平坦, 机制如此),
