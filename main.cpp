@@ -471,6 +471,7 @@ int main() {
     // 但单独存放、单独写盘, 不进 UIGF 的 "list"。
     std::pmr::vector<NonPullEvent> events(alloc);
     events.reserve(64);
+    size_t migratedLegacy = 0;   // 从旧版 list 里迁出的非抽卡事件条数 (仅用于提示)
 
     std::string uigfFilename = "uigf_endfield.json";
 
@@ -532,6 +533,31 @@ int main() {
                             }
 
                             ItemType it = ParseItemType(ExtractJsonValue(itemStr, "item_type", true));
+
+                            // ---- 旧版文件的自愈迁移 (v0.1.5.0) ----
+                            // v0.1.5.0 之前的版本会把非抽卡事件当成抽卡写进 list, 落地成
+                            // item_id / item_name / rank_type 全空的畸形记录 (旧版把只有
+                            // seqId 的事件行照单全收, 而那些"抽卡才有"的字段本就不存在)。
+                            // 这里把它们就地迁到 non_pull_events, 而不是原样写回 list ——
+                            // 否则畸形记录会一直留在抽卡数组里, 每个读这个文件的第三方工具
+                            // 都要踩一次。
+                            //
+                            // 判据与拉取时同源: 没有物品 id 且没有稀有度 ⇒ 不是一次抽卡。
+                            // raw 存【旧文件里那个对象的原文】, 不去猜测、也不补造服务器字段:
+                            // 旧版根本没读过 kind / nameText, 凭空写上就是伪造。因此迁移来的
+                            // raw 是 UIGF 形状 (snake_case), 与新拉取的服务器原始对象
+                            // (camelCase) 形状不同 —— 这一差异本身就标明了它的来历。
+                            if (ExtractJsonValue(itemStr, "item_id", true).empty() &&
+                                ExtractJsonValue(itemStr, "rank_type", true).empty()) {
+                                NonPullEvent ev;
+                                ev.safe_id   = parsed_id;
+                                ev.timestamp = parsed_ts;
+                                ev.raw       = itemStr;
+                                events.push_back(ev);
+                                local_safe_ids.insert(parsed_id);
+                                ++migratedLegacy;
+                                return;
+                            }
 
                             // UIGF v4.2: gacha_type / item_name / pool_name / weapon_type / is_new / is_free
                             // (原: uigf_gacha_type / name / poolName / weaponType / isNew / isFree)
@@ -607,6 +633,10 @@ int main() {
                 printf("成功加载本地存储的 %zu 条抽卡记录", records.size());
                 if (!events.empty()) printf(" 与 %zu 条非抽卡事件", events.size());
                 printf("。\n");
+                if (migratedLegacy > 0) {
+                    printf("已把 %zu 条误存在抽卡数组里的非抽卡事件迁移到 non_pull_events。\n",
+                           migratedLegacy);
+                }
             }
         } else {
             DWORD openErr = GetLastError();
