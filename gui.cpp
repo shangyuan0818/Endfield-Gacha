@@ -2744,7 +2744,7 @@ struct Layout {
 Layout ComputeLayout(HWND hwnd) {
     Layout L;
     RECT rc; GetClientRect(hwnd, &rc);
-    L.clientW = rc.right; L.clientH = rc.bottom;
+    L.clientW = (int)rc.right; L.clientH = (int)rc.bottom;   // RECT 成员是 LONG, 显式收敛
     if (L.clientW <= 0 || L.clientH <= 0) return L;
 
     const int mx = DPIScale(ui::kMarginX);
@@ -2782,24 +2782,37 @@ void LayoutChildren(HWND hwnd, const Layout& L) {
     if (!hCharEdit) return;              // WM_CREATE 还没建完控件
     const int mx = DPIScale(ui::kMarginX);
     const int dy = -g_scrollY;
-    HDWP hdwp = BeginDeferWindowPos(8);  // 批量摆位, 减少缩放/滚动时的闪烁
-    auto put = [&](HWND h, int x, int y, int w, int hgt) {
-        if (!h) return;
-        if (hdwp) hdwp = DeferWindowPos(hdwp, h, NULL, x, y + dy, w, hgt,
-                                        SWP_NOZORDER | SWP_NOACTIVATE);
-        else      MoveWindow(h, x, y + dy, w, hgt, TRUE);   // DeferWindowPos 失败时的兜底
+
+    // 先把 8 个控件的目标位置算齐, 再统一提交。分两步是为了让 DeferWindowPos 中途失败时
+    // 能【整体】退回 MoveWindow —— 边算边 Defer 的话, 一旦失败, 之前已入队的那几个控件
+    // 会随着 HDWP 作废而停在原位, 出现"一半控件跟着滚、一半不动"的错位。
+    struct Place { HWND h; int x, y, w, hgt; };
+    Place places[8];
+    int n = 0;
+    auto add = [&](HWND h, int x, int y, int w, int hgt) {
+        if (h && n < 8) places[n++] = Place{h, x, y + dy, w, hgt};
     };
-    put(hHintLabel,    mx, DPIScale(ui::kHintY),
+    add(hHintLabel, mx, DPIScale(ui::kHintY),
         (std::max)(DPIScale(100), L.clientW - 2 * mx), DPIScale(ui::kLabelH));
     for (int i = 0; i < 3; ++i) {
         const int rowY = DPIScale(ui::kRowY0 + i * ui::kRowStep);
         HWND lbl  = (i == 0) ? hCharLabel : (i == 1) ? hPoolMapLabel : hWepLabel;
         HWND edit = (i == 0) ? hCharEdit  : (i == 1) ? hPoolMapEdit  : hWepEdit;
-        put(lbl,  mx,      rowY + DPIScale(ui::kLabelDY), DPIScale(ui::kLabelW), DPIScale(ui::kLabelH));
-        put(edit, L.editX, rowY,                          L.editW,               DPIScale(ui::kEditH));
+        add(lbl,  mx,      rowY + DPIScale(ui::kLabelDY), DPIScale(ui::kLabelW), DPIScale(ui::kLabelH));
+        add(edit, L.editX, rowY,                          L.editW,               DPIScale(ui::kEditH));
     }
-    put(hOutEdit, mx, L.outY, L.outW, L.outH);
-    if (hdwp) EndDeferWindowPos(hdwp);
+    add(hOutEdit, mx, L.outY, L.outW, L.outH);
+
+    // 批量摆位, 减少缩放/滚动时的闪烁
+    HDWP hdwp = BeginDeferWindowPos(n);
+    for (int i = 0; i < n && hdwp; ++i) {
+        hdwp = DeferWindowPos(hdwp, places[i].h, NULL,
+                              places[i].x, places[i].y, places[i].w, places[i].hgt,
+                              SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (hdwp) { EndDeferWindowPos(hdwp); return; }
+    for (int i = 0; i < n; ++i)          // 兜底: 批量提交失败时逐个摆
+        MoveWindow(places[i].h, places[i].x, places[i].y, places[i].w, places[i].hgt, TRUE);
 }
 
 void UpdateScrollInfo(HWND hwnd, const Layout& L) {
@@ -2822,7 +2835,10 @@ void UpdateScrollInfo(HWND hwnd, const Layout& L) {
 // 只重新摆子控件 + 触发一次 WM_PAINT 换 BitBlt 源点 —— 滚动因此是廉价操作。
 void ScrollTo(HWND hwnd, int pos) {
     RECT rc; GetClientRect(hwnd, &rc);
-    const int maxPos = (std::max)(0, g_contentH - rc.bottom);
+    // RECT 成员是 LONG, 与 int 混用会让 std::max 的模板实参推导出现歧义 (MSVC C2672),
+    // 故先显式收敛到 int 再比较。下面 ComputeLayout 里也是同样的处理。
+    const int clientH = (int)rc.bottom;
+    const int maxPos  = (std::max)(0, g_contentH - clientH);
     pos = (std::min)((std::max)(pos, 0), maxPos);
     if (pos == g_scrollY) return;
     g_scrollY = pos;

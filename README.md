@@ -15,12 +15,12 @@ Gacha tracker and visualizer for Arknights: Endfield. Built with C++20 &amp; Win
    运行用于分析与可视化抽卡数据的 `gui.exe` 图形界面程序，并将 `uigf_endfield.json` 拖拽到程序窗口中。
 
 > [!IMPORTANT]
-> Since version 1.4, the in-game headhunting record only covers **the last 90 days**. Records older than
-> that are dropped by the official API and can never be fetched again. `main.exe` merges each run into
-> the existing `uigf_endfield.json` incrementally, so run it regularly and keep that file — it is the only
-> long-term archive of your pulls.
+> The in-game headhunting record only covers **the last 90 days**. Records older than that are dropped
+> by the official API and can never be fetched again. `main.exe` merges each run into the existing
+> `uigf_endfield.json` incrementally, so run it regularly and keep that file — it is the only long-term
+> archive of your pulls.
 >
-> 自 1.4 版本起，游戏内【寻访记录】只支持查询**最近 90 天**的记录，更早的记录会被官方接口丢弃且无法再取回。
+> 游戏内【寻访记录】只支持查询**最近 90 天**的记录，更早的记录会被官方接口丢弃且无法再取回。
 > `main.exe` 是增量合并到已有的 `uigf_endfield.json` 的，所以请定期运行并保留该文件 —— 它是你抽卡历史的唯一长期存档。
 
 
@@ -32,18 +32,6 @@ Gacha tracker and visualizer for Arknights: Endfield. Built with C++20 &amp; Win
    打开 **"x64 Native Tools Command Prompt for VS"** 应用。
 3. Copy the command from `Compile.txt` and paste it into the command prompt, then press Enter to run.
    打开 `Compile.txt`，把命令复制粘贴到命令行应用中，按下回车运行。
-
-
-
-## Window 窗口
-The window is resizable and maximizable. Charts scale with the window width, and the four chart rows
-share the remaining height (growing on tall displays). When the content does not fit — on a 1080p
-screen, for example — a vertical scrollbar appears. This mirrors the Apple version, whose macOS view
-wraps the whole content in a `ScrollView`.
-
-窗口可自由缩放与最大化。图表宽度跟随窗口，四行图表平分剩余高度（屏幕越高图表越大）；内容放不下时
-（例如 1080p 屏）会出现垂直滚动条。该行为与 Apple 版一致 —— 其 macOS 界面同样把整个内容区套在
-`ScrollView` 中。
 
 
 
