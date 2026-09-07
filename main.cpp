@@ -266,6 +266,36 @@ std::string FetchPath(HINTERNET hConnect, const std::wstring& path, bool& netOk)
 struct PoolConfig { std::string poolType, displayName; bool isWeapon; };
 
 // ---------------------------------------------------------
+// [非抽卡事件]  v0.1.5.0
+//
+// /api/record/char 的 list 里除了真实抽卡, 还会混入"发放某个道具"的事件行。
+// 目前已确认的一种是【寻访情报书】(kind = "gift_intel_book"): 特许寻访累计 60 次本体抽
+// 发放 1 本, 于下一次特许寻访开启后自动转化为该池专有寻访凭证 ×10
+// (客户端 GachaCharPoolTypeTable type=0 的 testimonialPullCount = 60, 每个 special_* 池
+//  带 testimonialRewardItemId 如 "item_gacha_introletter_1_5_1";
+//  官方公告原文见 https://endfield.hypergryph.com/news/6097 的「寻访情报书」一条)。
+// 这类行有 seqId / gachaTs / poolId / poolName, 但【没有】charId / charName / rarity。
+//
+// 处理策略:
+//   - 不写进 UIGF 的 "list" —— 那是抽卡记录数组, 混入非抽卡行会让所有读这个文件的
+//     工具都得知道这个怪癖 (实测: 第三方平台导出把它们全部剔除, 多个同类工具也都写了
+//     过滤)。放进去还会让不做过滤的工具把保底水位每期多算 1 抽。
+//   - 但也【不丢弃】: 抽卡记录接口只保留最近 90 天, 本地文件是唯一的长期存档,
+//     丢掉就再也取不回来。历史被 90 天窗口截断时, 这条事件的时间戳还能反推出
+//     "此刻我在该池已累计满 60 抽"这一信息。
+//   - 折中: 存到顶层的 "non_pull_events" 数组里, 且【原样保留服务器返回的整个 JSON 对象】,
+//     这样将来出现新的 kind (例如 240 抽的 UP 信物、武器申领的补充武库箱) 也不会丢字段。
+//
+// raw 是指向 networkPayloads 里某个 std::string 的视图 (与 ExportRecord 的字段同源),
+// 在写盘前始终有效。
+// ---------------------------------------------------------
+struct NonPullEvent {
+    long long        safe_id   = 0;   // 与抽卡记录同一套 id 口径 (角色正 / 武器负), 用于去重
+    long long        timestamp = 0;   // gachaTs, 仅用于排序
+    std::string_view raw;             // 服务器原始 JSON 对象 (含大括号), 原样回写
+};
+
+// ---------------------------------------------------------
 // [BufferedWriter - 析构 RAII Flush + 短写/失败检查]
 // ---------------------------------------------------------
 struct BufferedWriter {
@@ -437,6 +467,11 @@ int main() {
     std::pmr::unordered_set<long long> local_safe_ids(alloc);
     local_safe_ids.reserve(10000);
 
+    // 非抽卡事件 (见 NonPullEvent 说明): 与抽卡记录共用 local_safe_ids 做去重,
+    // 但单独存放、单独写盘, 不进 UIGF 的 "list"。
+    std::pmr::vector<NonPullEvent> events(alloc);
+    events.reserve(64);
+
     std::string uigfFilename = "uigf_endfield.json";
 
     // ---- 读取本地老记录(读完立即释放句柄,避免锁住目标文件)----
@@ -519,11 +554,59 @@ int main() {
                             });
                             local_safe_ids.insert(parsed_id);
                         });
+
+                        // 非抽卡事件的往返读取。旧版文件没有这个键, ForEachJsonObject
+                        // 直接返回 false, 这里不关心返回值 —— 缺失 = 0 条, 属正常情况,
+                        // 不能影响 baseLoadOk (那是"文件是否可用"的判据, 只看 "list")。
+                        //
+                        // 包装对象的形状是 { "id", "gacha_ts", "raw": {服务器原始对象} }。
+                        // "id" / "gacha_ts" 写在 "raw" 之前, 而 FindJsonKey 取的是首个匹配,
+                        // 所以即便将来某个 kind 的原始对象里也有同名键, 也不会被读串。
+                        ForEachJsonObject(bufferView, "non_pull_events", [&](std::string_view evtStr) {
+                            NonPullEvent ev;
+                            std::string_view idStr = ExtractJsonValue(evtStr, "id", true);
+                            if (idStr.empty()) return;
+                            std::from_chars(idStr.data(), idStr.data() + idStr.size(), ev.safe_id);
+                            std::string_view tsStr = ExtractJsonValue(evtStr, "gacha_ts", true);
+                            if (!tsStr.empty()) {
+                                std::from_chars(tsStr.data(), tsStr.data() + tsStr.size(), ev.timestamp);
+                            }
+                            // 取出 "raw" 后面那个完整对象 (含大括号), 原样留存
+                            size_t rawPos = FindJsonKey(evtStr, "raw");
+                            if (rawPos != std::string_view::npos) {
+                                size_t braceOpen = evtStr.find('{', rawPos);
+                                if (braceOpen != std::string_view::npos) {
+                                    int depth = 0;
+                                    for (size_t k = braceOpen; k < evtStr.size(); ++k) {
+                                        char c = evtStr[k];
+                                        if (c == '"') {   // 跳过字符串, 里面的花括号不计深度
+                                            for (++k; k < evtStr.size(); ++k) {
+                                                if (evtStr[k] == '\\' && k + 1 < evtStr.size()) { ++k; continue; }
+                                                if (evtStr[k] == '"') break;
+                                            }
+                                            continue;
+                                        }
+                                        if (c == '{') ++depth;
+                                        else if (c == '}') {
+                                            if (--depth == 0) {
+                                                ev.raw = evtStr.substr(braceOpen, k - braceOpen + 1);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (ev.raw.empty()) return;      // 结构异常的条目直接丢弃, 不回写
+                            events.push_back(ev);
+                            local_safe_ids.insert(ev.safe_id);
+                        });
                     }
                 }
             }
             if (baseLoadOk) {
-                printf("成功加载本地存储的 %zu 条抽卡记录。\n", records.size());
+                printf("成功加载本地存储的 %zu 条抽卡记录", records.size());
+                if (!events.empty()) printf(" 与 %zu 条非抽卡事件", events.size());
+                printf("。\n");
             }
         } else {
             DWORD openErr = GetLastError();
@@ -628,27 +711,15 @@ int main() {
                 std::from_chars(rawSeqIdStr.data(), rawSeqIdStr.data() + rawSeqIdStr.size(), rawSeqId);
                 lastSeqParsed = rawSeqId;
 
-                // v0.1.4.0:「寻访情报书」幽灵记录过滤。
-                //   特许寻访累计 60 抽会发一本【寻访情报书】(客户端 GachaCharPoolTypeTable
-                //   type=0 的 testimonialPullCount=60, 每个 special_* 池带 testimonialRewardItemId
-                //   如 "item_gacha_introletter_1_5_1")。该发放事件会作为一条记录混在
-                //   /api/record/char 的 list 里返回, 但它【不是一次寻访】: 有 seqId / gachaTs /
-                //   poolId, 却没有 charId / charName / rarity, 靠 kind == "gift_intel_book" 区分。
-                //   照单全收会污染 UIGF 导出与抽卡总数, 并让分析端的保底水位每 60 抽多算 1 抽。
-                //   (上游同类工具自 2026-08 起也都加了同一过滤, 见 bhaoo/endfield-gacha #44。)
-                //   重构寻访 type=4 的 testimonialPullCount=0, 不产生这类记录;
-                //   /api/record/weapon 侧也未观察到。
-                //
-                //   注意: 必须放在 lastSeqParsed 赋值【之后】—— 幽灵记录同样占用 seqId 序列,
-                //   若在更新翻页游标前就 return, 分页会卡住或漏页。
-                if (ExtractJsonValue(itemStr, "kind", true) == "gift_intel_book") return;
-
                 // v0.1.3.3: 取反改无符号形式 —— 直接 -rawSeqId 在 rawSeqId==LLONG_MIN 时是
                 // 有符号溢出 UB。该值来自服务器正序列号, 实际不可达, 属零成本加固
                 // (与分析器 abs_ll 口径对齐); 无符号模运算取反 + 补码窄化全程有定义。
                 long long safeUniqueId = poolCfg.isWeapon
                     ? (long long)(0ULL - (unsigned long long)rawSeqId) : rawSeqId;
 
+                // 去重与防缺口的判定【对抽卡和非抽卡事件一视同仁】(v0.1.5.0):
+                //   两者共用同一套 seqId 序列, 都要能触发"触达本地老记录"的停止条件,
+                //   否则事件行会被反复重新拉取。分类放在这些检查【之后】。
                 if (local_safe_ids.contains(safeUniqueId)) {
                     reachedExisting = true;
                     printf("  * 触达本地老记录 (ID: %lld),停止追溯。\n", rawSeqId);
@@ -670,22 +741,52 @@ int main() {
                     std::from_chars(tsStr.data(), tsStr.data() + tsStr.size(), parsed_ts);
                 }
 
+                // ---- 抽卡 / 非抽卡事件 的分流 (v0.1.5.0) ----
+                // 用【正向判据】而不是"kind == gift_intel_book"的黑名单: 已知的非抽卡 kind
+                // 目前只有寻访情报书一种, 但官方还有 240 抽的 UP 干员信物、武器申领累计
+                // 10/18 次的补充武库箱等发放节点, 它们会不会也进这个接口尚无证据。
+                // 白名单写法让任何未知的新 kind 自动落到事件通道, 而不是等到有人发现
+                // 统计数字不对才去补黑名单。
+                //   条件一: kind 缺失 (老记录本来就没这个字段) 或等于 "draw"
+                //   条件二: 物品 id 与稀有度都在 —— 真实抽卡必然两者俱全, 这道保险能兜住
+                //           "服务器某个版本/区服没下发 kind" 的情况
+                std::string_view kindStr   = ExtractJsonValue(itemStr, "kind", true);
+                std::string_view rarityStr = ExtractJsonValue(itemStr, "rarity", false);
+                std::string_view itemIdStr = poolCfg.isWeapon
+                    ? ExtractJsonValue(itemStr, "weaponId", true)
+                    : ExtractJsonValue(itemStr, "charId",   true);
+                const bool kindSaysPull = kindStr.empty() || kindStr == "draw";
+
+                if (!kindSaysPull || itemIdStr.empty() || rarityStr.empty()) {
+                    NonPullEvent ev;
+                    ev.safe_id   = safeUniqueId;
+                    ev.timestamp = parsed_ts;
+                    ev.raw       = itemStr;          // 原样保留整个服务器对象
+                    events.push_back(ev);
+                    poolFetchedCount++;              // 计入本池已吃进的条数 (缺口保护同样适用)
+                    std::string_view label = ExtractJsonValue(itemStr, "nameText", true);
+                    printf("  获取到(非抽卡事件): %.*s [kind=%.*s]\n",
+                           (int)label.size(),   label.data(),
+                           (int)kindStr.size(), kindStr.data());
+                    return;
+                }
+
                 ExportRecord rec;
                 rec.safe_id    = safeUniqueId;
                 rec.timestamp  = parsed_ts;
                 rec.poolId     = ExtractJsonValue(itemStr, "poolId", true);
-                rec.rank_type  = ExtractJsonValue(itemStr, "rarity", false);
+                rec.rank_type  = rarityStr;
                 rec.poolName   = ExtractJsonValue(itemStr, "poolName", true);
                 rec.isNew      = (uint8_t)(ExtractJsonValue(itemStr, "isNew", false)  == "true" ? 1 : 0);
                 rec.isFree     = (uint8_t)(ExtractJsonValue(itemStr, "isFree", false) == "true" ? 1 : 0);
 
                 if (poolCfg.isWeapon) {
-                    rec.item_id    = ExtractJsonValue(itemStr, "weaponId",   true);
+                    rec.item_id    = itemIdStr;
                     rec.name       = ExtractJsonValue(itemStr, "weaponName", true);
                     rec.item_type  = ItemType::Weapon;
                     rec.weaponType = ExtractJsonValue(itemStr, "weaponType", true);
                 } else {
-                    rec.item_id    = ExtractJsonValue(itemStr, "charId",   true);
+                    rec.item_id    = itemIdStr;
                     rec.name       = ExtractJsonValue(itemStr, "charName", true);
                     rec.item_type  = ItemType::Character;
                     rec.weaponType = {};
@@ -768,7 +869,14 @@ int main() {
             //
             // 顶层结构:
             //   { "info": { ... v4.2 公共字段 ... },
-            //     "endfield": [ { "uid", "timezone", "lang", "list": [ ... ] } ] }
+            //     "endfield": [ { "uid", "timezone", "lang", "list": [ ... ] } ],
+            //     "non_pull_events": [ ... ]   // v0.1.5.0 新增, 仅在非空时出现
+            //   }
+            //
+            // "non_pull_events" 是本工具的扩展键, 不属于 UIGF 标准, 也【不应】被当作抽卡
+            // 记录读取。UIGF 标准本身没有规定非抽卡事件该放哪里 (它只定义抽卡记录的
+            // schema), 这里选择独立键而非塞进 list, 是为了让 list 对所有第三方 UIGF
+            // 工具保持"每一条都是一次抽卡"的语义。详见 NonPullEvent 的说明。
             //
             // 注意: v4.2 info 不再含 uid/lang/uigf_version,而是:
             //   - export_timestamp / export_app / export_app_version (必需)
@@ -777,6 +885,8 @@ int main() {
             //
             // 自定义业务字段(API 原始信息保留)统一改为 snake_case:
             //   gacha_ts / pool_name / weapon_type / is_new / is_free
+            // (例外: non_pull_events[].raw 里是服务器原始对象, 保持其原有的 camelCase,
+            //  因为那一段是原样透传, 不做任何改写)
             // ==========================================================
 
             time_t t = export_ts;
@@ -794,7 +904,7 @@ int main() {
             w.Write(numBuf, (DWORD)(ptr - numBuf));
             w.WriteLit(",\n");
             w.WriteLit("        \"export_app\": \"Endfield Exporter\",\n"
-                       "        \"export_app_version\": \"v2.7.0\",\n"
+                       "        \"export_app_version\": \"v2.8.0\",\n"
                        "        \"version\": \"v4.2\",\n");
             // export_time 不在 v4.2 必需字段里,但保留作为人类可读辅助信息
             w.WriteLit("        \"export_time\": \""); w.Write(tbuf, tlen); w.WriteLit("\"\n    },\n");
@@ -851,7 +961,37 @@ int main() {
                 w.WriteLit("\n");
             }
 
-            w.WriteLit("            ]\n        }\n    ]\n}\n");
+            // ---- 非抽卡事件 (v0.1.5.0) ----
+            // 放在 "endfield" 之后的顶层键。有意【不】混进 list:
+            //   list 是 UIGF 定义的抽卡记录数组, 任何读这个文件的第三方工具都会按抽卡来数;
+            //   而这些行不是抽卡, 混进去会让不做过滤的工具把保底水位每期多算 1 抽。
+            //   放在独立键里, list 对所有 UIGF 工具保持干净, 信息也一条不丢。
+            // 每个元素是 { "id", "gacha_ts", "raw" }: 前两个是本工具自用的检索字段
+            // (写在前面, 保证 FindJsonKey 的首个匹配一定命中它们), raw 是服务器原始对象,
+            // 原样透传 —— 将来出现新的 kind 也不会因为字段没被识别而丢失。
+            if (!events.empty()) {
+                std::ranges::sort(events, [&](const NonPullEvent& a, const NonPullEvent& b) {
+                    if (a.timestamp != b.timestamp) return a.timestamp < b.timestamp;
+                    return abs_ll(a.safe_id) < abs_ll(b.safe_id);
+                });
+                w.WriteLit("            ]\n        }\n    ],\n");
+                w.WriteLit("    \"non_pull_events\": [\n");
+                const size_t m = events.size();
+                for (size_t i = 0; i < m; ++i) {
+                    const auto& ev = events[i];
+                    w.WriteLit("        {\n");
+                    w.WriteI64KV("id", ev.safe_id, true);         w.WriteLit(",\n");
+                    w.WriteI64KV("gacha_ts", ev.timestamp, true); w.WriteLit(",\n");
+                    w.WriteLit("            \"raw\": ");
+                    w.Write(ev.raw);
+                    w.WriteLit("\n        }");
+                    if (i < m - 1) w.WriteLit(",");
+                    w.WriteLit("\n");
+                }
+                w.WriteLit("    ]\n}\n");
+            } else {
+                w.WriteLit("            ]\n        }\n    ]\n}\n");
+            }
             w.Flush();              // 显式收尾 flush 并捕获结果 (析构里那次因 pos==0 成 no-op)
             writeOk = w.ok;
         }
