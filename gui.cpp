@@ -362,6 +362,8 @@ struct StatsResult {
     std::array<double, 260> hazard_all{}, hazard_up{};
     double ks_d_all = 0.0, ks_d_up = 0.0;
     bool ks_is_normal = true, ks_is_normal_up = true;
+    // v0.1.4.0: UP 侧样本是否为"两种分布的混合", 混合时不输出拟合判定 (见 Calculate)
+    bool ks_up_mixed = false;
     // 右删失(用于显示"当前已垫 N 抽")
     int censored_pity_all = 0;
     int censored_pity_up  = 0;
@@ -439,6 +441,11 @@ float DPIScaleF(float value) { return value * (g_dpi / 96.0f); }
 //     - 验证: cdf[240] + 长尾点质量 与 simulate 到 n=2000 精确 MRL 全程误差 < 1e-9 抽.
 //     - 历史: v0.1.2.3 用过 g_cdf_joint_up[1002] 物理扩到 1000 抽让 CDF 自然收敛到
 //             0.999993, 数学等价但浪费 ~8KB 静态内存, v0.1.2.4 改用解析延伸.
+// 角色寻访的基础六星概率 (客户端 GachaCharPoolTypeTable: star6BaseRate = 8000 → 0.8%)。
+// 赠送十连(加急招募)恒按【基础概率】判定, 不吃 66 抽起的软保底加成 —— 见下方各
+// 免费十连展开循环。
+constexpr double kBaseRate6 = 0.008;
+
 static double g_cdf_char[82]   = {};  // x=0..80,角色池综合
 static double g_cdf_wep[41]    = {};  // x=0..40,武器池综合
 static double g_cdf_char_up[122] = {};  // x=0..120, 角色池 UP
@@ -583,7 +590,7 @@ void InitCDFTables() {
                     std::array<double, max_soft> newStateA{};
                     for (int s = 0; s < max_soft; ++s) {
                         if (stateA[s] == 0) continue;
-                        double ph = h_char(s + 1);
+                        const double ph = kBaseRate6;   // 赠送十连走基础概率, 不吃软保底加成
                         newStateA[s] += stateA[s] * (1.0 - ph);   // 不出货, 水位停
                         p_hit_grad   += stateA[s] * ph * 0.5;     // 毕业 (出 UP)
                         newStateA[s] += stateA[s] * ph * 0.5;     // 歪, 水位停 (isFree)
@@ -637,7 +644,7 @@ void InitCDFTables() {
         double surv_rf = 1.0;
         for (int i = 1; i <= 80; ++i) {
             double p;
-            if (i == 30 || i == 60) p = 1.0 - std::pow(1.0 - 0.008, 11);  // 本体 1 抽 + 免费十连 10 抽
+            if (i == 30 || i == 60) p = 1.0 - std::pow(1.0 - kBaseRate6, 11);  // 本体 1 抽 + 免费十连 10 抽
             else if (i <= 65)       p = 0.008;
             else if (i <= 79)       p = 0.058 + (i - 66) * 0.05;
             else                    p = 1.0;
@@ -712,7 +719,15 @@ void InitCDFTables() {
                     std::array<double, max_soft> newStateA{};
                     for (int s = 0; s < max_soft; ++s) {
                         if (stateA[s] == 0) continue;
-                        double ph = h_rf(s + 1);
+                        // 赠送十连走【基础概率】, 不吃软保底加成 —— 官方对加急招募的原文是
+                        // 「加急招募的干员获取概率与本次寻访的基础概率一致」, 且其结果不计入
+                        // 保底计数。故这里必须用 kBaseRate6 而不是 h_rf(s+1)。
+                        //
+                        // 为什么特许/辉光池没暴露这个问题: 它们只有 n=30 一个赠送节点, 那时
+                        // 水位 s <= 30 < 66, h() 本来就等于基础概率, 两种写法数值相同。
+                        // 重构池的第 3 个节点在 n=90, 存活水位可以到 66..79 的软保底段 ——
+                        // 若沿用 h_rf, 免费单抽会被算成最高 30.8% 的出货率 (基础是 0.8%)。
+                        const double ph = kBaseRate6;
                         newStateA[s] += stateA[s] * (1.0 - ph);   // 不出货, 水位停
                         p_hit_grad   += stateA[s] * ph * 0.5;     // 毕业 (出 UP)
                         newStateA[s] += stateA[s] * ph * 0.5;     // 歪, 水位停 (isFree)
@@ -852,7 +867,7 @@ void InitCDFTables() {
                     std::array<double, max_soft> newStateA{};
                     for (int s = 0; s < max_soft; ++s) {
                         if (stateA[s] == 0) continue;
-                        double ph = h_char(s + 1);
+                        const double ph = kBaseRate6;   // 赠送十连走基础概率, 不吃软保底加成
                         newStateA[s] += stateA[s] * (1.0 - ph);          // 不出货, 水位停
                         p_hit_grad   += stateA[s] * ph * 0.5;            // 毕业
                         newStateA[s] += stateA[s] * ph * 0.5;            // 非限定, 水位停 (isFree)
@@ -928,7 +943,7 @@ void InitCDFTables() {
                         std::array<double, max_soft> newStateA{};
                         for (int s = 0; s < max_soft; ++s) {
                             if (stateA[s] == 0) continue;
-                            double ph = h_char(s + 1);
+                            const double ph = kBaseRate6;   // 同上: 赠送十连走基础概率
                             newStateA[s] += stateA[s] * (1.0 - ph);
                             p_hit_grad   += stateA[s] * ph * 0.5;
                             newStateA[s] += stateA[s] * ph * 0.5;
@@ -1133,10 +1148,17 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
 
     // 赠送十连块计数 (v0.1.4.0): 重构寻访在累计 30/60/90 抽各送 1 次免费十连,
     //   需要把每个 isFree 块映射到对应的里程碑节点, 否则三个块会全部挤在节点 30,
-    //   与理论 CDF 对不上。块边界 = 由"非 isFree → isFree"的跳变探测 (每块 10 条记录)。
-    //   特许/辉光只有 1 处赠送十连, 保持原行为 (恒为节点 30), 不受影响。
-    int     free_block_idx = 0;
-    uint8_t prev_is_free   = 0;
+    //   与理论 CDF 对不上。特许/辉光只有 1 处赠送十连, 恒为节点 30, 不受影响。
+    //
+    //   计法: 直接数【本桶内累计的 isFree 记录条数】, 第 n 条属于第 (n/10) 块 (0-based)。
+    //   不能靠"非 isFree → isFree 的跳变"来分块 —— 官方允许把未使用的加急招募留到后面
+    //   (「未使用的加急招募, 将保留到后续同名重构寻访中」), 玩家完全可能攒够 90 抽后
+    //   连着开三次十连, 记录里就是连续 30 条 is_free=true, 跳变法只会数出 1 块。
+    //
+    //   已知局限: 抽卡记录只保留最近 90 天, 历史被截断时第一块可能只剩半截, 会让后续
+    //   块序号整体偏移。无法从记录本身分辨, 故不做补偿 —— 影响仅限赠送出货落在哪个
+    //   理论节点, 不影响出货计数与胜负统计。
+    int free_pull_count = 0;
 
     // 第30抽赠送十连处理 (依据《明日方舟终末地抽卡机制解析》2.1.1):
     //   - "该十连享有基础概率(0.008),但不占用也不增加保底进度"
@@ -1150,15 +1172,26 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     for (size_t i = 0; i < total; ++i) {
         const bool isFree = bucket.is_free[i];
 
-        // 赠送十连块边界探测 (非 free → free 的跳变 = 新的一块十连)
-        if (isFree && !prev_is_free) ++free_block_idx;
-        prev_is_free = (uint8_t)(isFree ? 1 : 0);
+        // 本条若是赠送十连, 先算出它属于第几块 (1-based), 再累加计数
+        int free_block_idx = 0;
+        if (isFree) free_block_idx = (free_pull_count++ / 10) + 1;
 
         // 卡池边界探测: 读分桶阶段预计算的字节标记 (v0.1.3.2), 不再在热路径 memcmp 池名。
         //   starts_new_banner[i] = (本条 poolName 与上一条不同); 首条恒为 0 → 已含原 i>0 守卫。
         //   特许池: 120 硬保底不继承 → pity_since_last_up + got_up_banner 清零; 80 小保底继承 (current_pity 不动)
         //   武器池: 40 + 80 都不继承 → current_pity + pity_since_last_up + got_up_banner 全清零
-        if (track_banner && bucket.starts_new_banner[i]) {
+        // 重构寻访 (v0.1.4.0): 官方给的两个作用域【不同】——
+        //   80 抽六星保底: 「所有『重构寻访』共享此项保底机制…继承到其他『重构寻访』中」
+        //     ⇒ current_pity 跨所有重构池连续累加, 永不按期清零。
+        //   120 抽首个 UP 保底 / 累计奖励: 「该规则在【同名】重构寻访中仅生效 1 次,
+        //     该计数将继承到后续的【同名】重构寻访中」
+        //     ⇒ 只在【换到另一个系列】时才重置, 同名系列的 #1/#2/#3 之间继承。
+        //   数据里同名系列的各期共用同一个 pool_name (与特许池"每期一个新池名"不同),
+        //   所以 starts_new_banner (= pool_name 变化) 恰好就是"换系列"的判据。
+        //   已知局限: 若将来两个重构系列【同时开放】, 记录按时间交错, pool_name 会来回
+        //   跳变而产生误重置 —— 与武器池多期并行是同一类结构性问题, 待真实数据出现后
+        //   改成按系列分桶再解决。
+        if ((track_banner || isRefactor) && bucket.starts_new_banner[i]) {
             pity_since_last_up = 0;
             got_up_banner      = false;
             if (track_weapon) current_pity = 0;   // 武器 40 小保底也每期重算 (角色 80 小保底继承, 不清)
@@ -1239,9 +1272,15 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
                     acc.sum_win += slot_all;
                 }
             }
-            got_up_banner = true;
-            // 赠送十连出 UP 不重置 pity_since_last_up (独立通道); 正常出 UP/限定 重置
-            if (!isFree) pity_since_last_up = 0;
+            // 只有【本体抽】出的 UP 才消耗硬保底额度。赠送十连是独立通道, 官方明确
+            // 「加急招募所赠送的免费十连, 其抽取结果将不计入本次或其他寻访的保底计数」——
+            // 免费十连里出了 UP, 本体的 120 抽硬保底依然成立。
+            // (该问题在 main 上就存在, 不是重构池引入的: 旧写法无条件置 true, 会让免费出 UP
+            //  之后那次真正由 120 硬保底强制出的 UP 被误算成一次随机"不歪", 抬高胜率。)
+            if (!isFree) {
+                got_up_banner      = true;
+                pity_since_last_up = 0;   // 赠送十连出 UP 不重置水位 (独立通道)
+            }
         } else {
             // 非 UP/非限定六星 = 一次独立判定的“负”。终末地可连续歪多次, 全部如实计入。
             acc.lose_5050++;
@@ -1327,6 +1366,14 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         if (isWeapon)         cdf_up_tbl = g_cdf_wep_up;      // 81
         else if (isJoint)     cdf_up_tbl = g_cdf_joint_up;    // 242
         else if (isRefactor)  cdf_up_tbl = g_cdf_refactor_up; // 122
+        // g_cdf_refactor_up 描述的是【系列内第一个 UP】的分布 —— 它在 n=120 强制收敛到 1,
+        // 依据是「前120次寻访必定获取 UP, 该规则在同名重构寻访中仅生效 1 次」。
+        // 而 freq_up 记的是每两个 UP 之间的间隔: 第 2 个及以后的 UP 已经没有这个兜底,
+        // 分布是无截断的长尾。两者不是同一个统计对象, 一旦样本里出现第 2 个 UP,
+        // 整体就成了混合分布, 再拿这条曲线判"符合/偏离"就没有依据了。
+        // 这不需要等到复刻才会发生 —— 首期追潜多抽一个 UP 就会遇到。
+        // 故这里只标记, 由输出层把判定改成"样本混合"; D 值仍照常算出供参考。
+        if (isRefactor && acc.count_up > 1) s.ks_up_mixed = true;
         else                  cdf_up_tbl = g_cdf_char_up;     // 122
         if (isWeapon) {
             // v0.1.3.3 武器 UP K-S: 先把经验 freq_up 按申领 (10 抽) 粒度向上聚合再比较。
@@ -1699,6 +1746,8 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
     };
     auto ksUpLabel = [](const StatsResult& r) -> const wchar_t* {
         if (r.count_up == 0) return L"-";
+        // 混合样本 (首个 UP 带 120 兜底 / 后续 UP 无兜底) 没有单一理论分布可比, 不作判定
+        if (r.ks_up_mixed)   return L"样本混合, 不判定";
         return r.ks_is_normal_up ? L"符合理论模型" : L"偏离过大";
     };
     const wchar_t* ksCharLabel    = ksLabel  (out->statsChar);
@@ -1724,7 +1773,7 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
         L" ▶ 抽到任一限定 (非常驻) 的平均期望: %5.2f 抽 (理论 ≈ 104.68)  [95%% CI: %5.1f ~ %5.1f]    |   非常驻六星率: %5.1f%% (理论 50%%) (%d限定%d常驻)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n\r\n"
         L"【角色卡池 (重构寻访)】 总计六星: %d | 出当期 UP: %d%ls\r\n"
         L" ▶ 综合六星 (含歪) 出货平均期望:     %5.2f 抽 (理论 ≈ 51.37)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
-        L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 77.74)   [95%% CI: %5.1f ~ %5.1f]    |   真实不歪率: %5.1f%% (理论 50%%*) (%d胜%d负)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
+        L" ▶ 抽到当期限定 UP 的综合平均期望:   %5.2f 抽 (理论 ≈ 77.83)   [95%% CI: %5.1f ~ %5.1f]    |   真实不歪率: %5.1f%% (理论 50%%*) (%d胜%d负)\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
         L" ▶ 赢下小保底 (不歪) 的出货期望:     %ls\t\t(* UP 占比官方未公布, 暂沿用特许寻访的 50%%, 待开池后核实)\r\n\r\n"
         L"【武器卡池 (武库申领)】 总计六星: %d | 出当期 UP: %d%ls\r\n"
         L" ▶ 综合六星出货平均期望:             %5.2f 抽 (理论 ≈ 19.17)   [95%% CI: %5.1f ~ %5.1f]    |   波动率 (CV): %5.1f%%\t[K-S 检验偏离度 D值: %.3f (%ls)]\r\n"
@@ -1864,10 +1913,14 @@ bool ProcessFile_Submit(HWND hwnd, const std::wstring& path) {
 // 主线程消费 worker 结果. 必须在 WM_APP_PROCESS_DONE 里调用
 void ProcessFile_Consume(HWND hwnd, ProcessOutput* out) {
     if (out->ok) {
-        // 把结果搬到全局 statsChar/statsWep/statsJoint (主线程独占,不需要锁)
-        statsChar  = out->statsChar;
-        statsWep   = out->statsWep;
-        statsJoint = out->statsJoint;
+        // 把结果搬到全局 (主线程独占,不需要锁)。
+        // ★ 这里【每加一个池子就必须同步加一行】—— 图表绘制读的是这些全局量, 不是
+        //   out-> 里的字段。v0.1.4.0 曾漏掉 statsRefactor, 导致文字统计有六星、
+        //   重构寻访的两张图却始终显示"暂无出金数据"。
+        statsChar     = out->statsChar;
+        statsWep      = out->statsWep;
+        statsJoint    = out->statsJoint;
+        statsRefactor = out->statsRefactor;
         SetWindowTextW(hOutEdit, out->outMsg.c_str());
         RebuildChartCache(hwnd);
         InvalidateRect(hwnd, NULL, FALSE);
@@ -2949,7 +3002,7 @@ void RebuildChartCache(HWND hwnd) {
         // 数值与特许寻访逐字段相同 (0.8% 基础 / 66 抽起 +5% 软保底 / 80 硬保底 / 120 UP 硬保底),
         //   唯一差异是赠送十连从 1 次 (累计 30 抽) 变成 3 次 (累计 30/60/90 抽),
         //   故综合与 UP 都另建表: g_cdf_refactor / g_cdf_refactor_up (见 InitCDFTables)。
-        //   E[首六星] ≈ 51.37 (特许 51.81), E[首 UP] ≈ 77.74 (特许 79.29) —— 多出的两次
+        //   E[首六星] ≈ 51.37 (特许 51.81), E[首 UP] ≈ 77.83 (特许 79.29) —— 多出的两次
         //   赠送十连让两个期望都略微下降。
         // X 轴与特许池一致取 120 (UP 硬保底), MRL 的理论上限同为 80 / 120。
         DrawECDF  (g, Gdiplus::Rect(L.chartX1, L.RowY(2), L.chartW, L.chartRowH),
