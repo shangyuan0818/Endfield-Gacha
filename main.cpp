@@ -108,7 +108,7 @@ inline std::string_view ExtractJsonValue(std::string_view source, std::string_vi
     }
 }
 
-// ---- 顶层字段读取 (v0.1.4.0) ----
+// ---- 顶层字段读取 (v0.1.4.1) ----
 // ExtractJsonValue / FindJsonKey 都是"全文找首个同名键"的粗放做法: 只要键名在别处
 // 出现过 (哪怕是在嵌套对象里、或在别的字段的字符串值里), 就可能读串。对付服务器
 // 返回的临时报文够用, 但读【自己写的存档】时不行 —— 读串一条就意味着写盘时把原始
@@ -261,7 +261,7 @@ inline bool ParseFullInt64(std::string_view s, long long& out) {
     return true;
 }
 
-// 数组扫描的结果。v0.1.4.0: 从 bool 升级为三态 —— 只有"有没有找到"是不够的:
+// 数组扫描的结果。v0.1.4.1: 从 bool 升级为三态 —— 只有"有没有找到"是不够的:
 //   * 键存在但值不是数组 ("non_pull_events": { ... }), 或文件正好在 ':' 后被截断 ——
 //     旧版靠 source.find('[', pos) 无界前搜, 要么找不到而返回 false, 要么跳到文件后面
 //     某个不相干的数组上。返回 false 被上层理解为"旧格式文件, 没有这个键", 于是整段
@@ -467,7 +467,7 @@ std::string FetchPath(HINTERNET hConnect, const std::wstring& path, bool& netOk)
 struct PoolConfig { std::string poolType, displayName; bool isWeapon; };
 
 // ---------------------------------------------------------
-// [非抽卡事件]  v0.1.4.0
+// [非抽卡事件]  v0.1.4.1
 //
 // /api/record/char 的 list 里除了真实抽卡, 还会混入"发放某个道具"的事件行。
 // 目前已确认的一种是【寻访情报书】(kind = "gift_intel_book"): 特许寻访累计 60 次本体抽
@@ -614,7 +614,7 @@ int main() {
 
     // 角色寻访的 pool_type 枚举。
     //
-    // v0.1.4.0 新增 E_CharacterGachaPoolType_Rerun (重构寻访 RE-Factor Headhunting):
+    // v0.1.4.1 新增 E_CharacterGachaPoolType_Rerun (重构寻访 RE-Factor Headhunting):
     //   1.5「雪凇幽梦」引入的第五种角色寻访类型, 首期「绚丽异彩」2026/09/24 12:00 开启,
     //   poolId 形如 "rerun_chr_yvonne" (与其余四种一样, poolId 前缀 = 枚举后缀的小写)。
     //
@@ -682,7 +682,7 @@ int main() {
     // 结束时 MoveFileEx 覆盖原历史; "list" 数组存在但为空 = 结构正确的空数据, 0 条正常继续。
     bool baseFileExists = false;   // 文件存在 (无论能否读)
     bool baseLoadOk     = false;   // 打开 + 映射 + 结构 ("list" 数组完整闭合) 三关全过
-    // v0.1.4.0 存档保护: 事件区读坏了同样必须中止, 不能"读不懂就当没有"然后覆盖。
+    // v0.1.4.1 存档保护: 事件区读坏了同样必须中止, 不能"读不懂就当没有"然后覆盖。
     //   eventsCorrupt 为真 = 文件里【有】non_pull_events 键, 但数组没闭合 (截断) 或存在
     //   无法解析的条目。此时原文件里那些事件是唯一的副本 —— 抽卡记录接口只保留 90 天,
     //   一旦被覆盖就永久丢失。
@@ -728,7 +728,7 @@ int main() {
                             bufferView.remove_prefix(3);
                         }
 
-                        // ---- 存档一律按【结构路径】定位, 不做全文找键 (v0.1.4.0) ----
+                        // ---- 存档一律按【结构路径】定位, 不做全文找键 (v0.1.4.1) ----
                         // 抽卡数组的路径是 根.endfield[0].list, 事件数组是 根.non_pull_events。
                         // 全文找首个 "list" 在合法 JSON 上就能读错: 事件的 raw 是服务器原样
                         // 透传的对象, 未知 kind 完全可能自带 "list": [...]; 只要顶层成员顺序
@@ -757,8 +757,8 @@ int main() {
 
                             ItemType it = ParseItemType(ExtractJsonValue(itemStr, "item_type", true));
 
-                            // ---- 旧版文件的自愈迁移 (v0.1.4.0) ----
-                            // v0.1.4.0 之前的版本会把非抽卡事件当成抽卡写进 list, 落地成
+                            // ---- 旧版文件的自愈迁移 (v0.1.4.1) ----
+                            // v0.1.4.1 之前的版本会把非抽卡事件当成抽卡写进 list, 落地成
                             // item_id / item_name / rank_type 全空的畸形记录 (旧版把只有
                             // seqId 的事件行照单全收, 而那些"抽卡才有"的字段本就不存在)。
                             // 这里把它们就地迁到 non_pull_events, 而不是原样写回 list ——
@@ -883,7 +883,7 @@ int main() {
         return 1;
     }
 
-    // v0.1.4.0: 事件区受损与 list 受损同等对待 —— 都中止, 都不写盘。
+    // v0.1.4.1: 事件区受损与 list 受损同等对待 —— 都中止, 都不写盘。
     //   "读不懂就当没有"在这里是危险的默认: 抽卡记录接口只保留最近 90 天, 本地文件是
     //   这些事件的唯一副本, 一旦按"读到的部分"覆盖回去, 读不出来的那些就永久没了。
     //   宁可让用户看到报错去处理, 也不要静默地少写一段。
@@ -997,7 +997,7 @@ int main() {
                 long long safeUniqueId = poolCfg.isWeapon
                     ? (long long)(0ULL - (unsigned long long)rawSeqId) : rawSeqId;
 
-                // 去重与防缺口的判定【对抽卡和非抽卡事件一视同仁】(v0.1.4.0):
+                // 去重与防缺口的判定【对抽卡和非抽卡事件一视同仁】(v0.1.4.1):
                 //   两者共用同一套 seqId 序列, 都要能触发"触达本地老记录"的停止条件,
                 //   否则事件行会被反复重新拉取。分类放在这些检查【之后】。
                 if (local_safe_ids.contains(safeUniqueId)) {
@@ -1021,7 +1021,7 @@ int main() {
                     std::from_chars(tsStr.data(), tsStr.data() + tsStr.size(), parsed_ts);
                 }
 
-                // ---- 抽卡 / 非抽卡事件 的分流 (v0.1.4.0) ----
+                // ---- 抽卡 / 非抽卡事件 的分流 (v0.1.4.1) ----
                 // 用【正向判据】而不是"kind == gift_intel_book"的黑名单: 已知的非抽卡 kind
                 // 目前只有寻访情报书一种, 但官方还有 240 抽的 UP 干员信物、武器申领累计
                 // 10/18 次的补充武库箱等发放节点, 它们会不会也进这个接口尚无证据。
@@ -1080,7 +1080,7 @@ int main() {
                     (int)records.back().poolName.size(),  records.back().poolName.data());
             });
 
-            // 第四个异常分支 (v0.1.4.0): 记录数组本身结构异常。回调可能已经把本页前半段
+            // 第四个异常分支 (v0.1.4.1): 记录数组本身结构异常。回调可能已经把本页前半段
             // 吃进来了, 而数组在后面才断 / 混进非对象元素 —— 忽略返回值就等于"半页当整页":
             // 本页后面那些更早的记录不会再被读到, 而已吃进的新记录一旦落地, 下次增量拉取
             // 在最新记录处即触达老记录而停, 中间的缺口永远补不回来。与 netOk 那条同源,
@@ -1165,7 +1165,7 @@ int main() {
             // 顶层结构:
             //   { "info": { ... v4.2 公共字段 ... },
             //     "endfield": [ { "uid", "timezone", "lang", "list": [ ... ] } ],
-            //     "non_pull_events": [ ... ]   // v0.1.4.0 新增, 仅在非空时出现
+            //     "non_pull_events": [ ... ]   // v0.1.4.1 新增, 仅在非空时出现
             //   }
             //
             // "non_pull_events" 是本工具的扩展键, 不属于 UIGF 标准, 也【不应】被当作抽卡
@@ -1199,7 +1199,7 @@ int main() {
             w.Write(numBuf, (DWORD)(ptr - numBuf));
             w.WriteLit(",\n");
             w.WriteLit("        \"export_app\": \"Endfield Exporter\",\n"
-                       "        \"export_app_version\": \"2.7.0\",\n"
+                       "        \"export_app_version\": \"v2.7.0\",\n"
                        "        \"version\": \"v4.2\",\n");
             // export_time 不在 v4.2 必需字段里,但保留作为人类可读辅助信息
             w.WriteLit("        \"export_time\": \""); w.Write(tbuf, tlen); w.WriteLit("\"\n    },\n");
@@ -1256,7 +1256,7 @@ int main() {
                 w.WriteLit("\n");
             }
 
-            // ---- 非抽卡事件 (v0.1.4.0) ----
+            // ---- 非抽卡事件 (v0.1.4.1) ----
             // 放在 "endfield" 之后的顶层键。有意【不】混进 list:
             //   list 是 UIGF 定义的抽卡记录数组, 任何读这个文件的第三方工具都会按抽卡来数;
             //   而这些行不是抽卡, 混进去会让不做过滤的工具把保底水位每期多算 1 抽。
