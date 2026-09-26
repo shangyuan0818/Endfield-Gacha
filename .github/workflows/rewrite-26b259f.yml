@@ -73,7 +73,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -- main.cpp .github/workflows/rewrite-26b259f.yml
-          git diff --cached --check
+          git -c core.whitespace=cr-at-eol diff --cached --check
 
           staged="$(git diff --cached --name-only | sort)"
           expected="$(printf '%s\n%s' '.github/workflows/rewrite-26b259f.yml' 'main.cpp')"
