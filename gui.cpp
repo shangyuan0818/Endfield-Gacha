@@ -351,9 +351,17 @@ struct StatsAccumulator {
     int censored_pity_up  = 0;
 };
 
+struct KSLocation {
+    int x = 0;
+    double empirical = 0.0, theory = 0.0;
+};
+
 struct StatsResult {
     std::array<int, 260> freq_all{};
     std::array<int, 260> freq_up{};
+    // ECDF / KS 共用同一份频数: 武器 UP 按十连申领聚合, 其它池保持单抽。
+    // 原始 freq_up 仍供均值、风险函数和 MRL 使用。
+    std::array<int, 260> freq_ecdf_up{};
     int count_all = 0, count_up = 0;
     double avg_all = 0.0, avg_up = 0.0, avg_win = -1.0;
     double cv_all = 0.0, ci_all_err = 0.0, ci_up_err = 0.0;
@@ -361,6 +369,7 @@ struct StatsResult {
     double win_rate_5050 = -1.0;
     std::array<double, 260> hazard_all{}, hazard_up{};
     double ks_d_all = 0.0, ks_d_up = 0.0;
+    KSLocation ks_location_all{}, ks_location_up{};
     bool ks_is_normal = true, ks_is_normal_up = true;
     // v0.1.4.0: UP 侧样本是否为"两种分布的混合", 混合时不输出拟合判定 (见 Calculate)
     bool ks_up_mixed = false;
@@ -892,7 +901,7 @@ void InitCDFTables() {
             D = newD;
         }
         // 注: v0.1.2.2 起不再设 cdf[max_n+1]=1.0 哨兵 (drawTheoryCDF 直接画到数组末端
-        // 真实值 ~0.93). ComputeKS 内部对 x >= cdf_len 用 cdf[last_valid] fallback,
+        // 真实值 ~0.93). ComputeKS 内部对 x > last_valid 用 cdf[last_valid] fallback,
         // 不会因长尾未饱和而高估 K-S 偏差.
 
         // ---- 长尾解析延伸常量 g_joint_tail_mean_excess ----
@@ -986,32 +995,37 @@ void InitCDFTables() {
     g_cdf_init = true;  // 末尾置位,确保所有读者看到完整表
 }
 
+// 统计与绘图共用有效末端: 饱和到 1, 或未填充哨兵造成单调性破坏前的最后一格。
+// 辉光 UP 表在 240 抽仍未饱和, 241 抽的零值不是有效概率。
+int FindCDFLastValid(std::span<const double> cdf_table) {
+    if (cdf_table.empty()) return 0;
+    constexpr double EPS_SAT = 1e-6;
+    for (int k = 1; k < (int)cdf_table.size(); ++k) {
+        if (cdf_table[k] >= 1.0 - EPS_SAT) return k;
+        if (cdf_table[k] + EPS_SAT < cdf_table[k - 1]) return k - 1;
+    }
+    return (int)cdf_table.size() - 1;
+}
+
 // 修复:离散阶梯 CDF 的 K-S 统计量需严格对齐两条阶梯
 // 在 x 处,两条阶梯的"底":F_n(cum before x),F_theory(x-1)
 // 在 x 处,两条阶梯的"顶":F_n(cum after x),F_theory(x)
 // 原版用 fn_before 减 cdf_table[x] —— 拿经验阶梯底对理论阶梯顶,
 // 人为引入 h_x 的单点跳跃(软保底段可高达 5%+),造成巨大伪偏差
 double ComputeKS(const std::array<int, 260>& freq, int max_pity, int n,
-                 std::span<const double> cdf_table) {
-    // v0.1.3.3: "裸指针 + 长度"两个散参 → std::span (C++20)。长度随表走,
-    // 调用方不可能再把表和长度传错配对; 函数体保留局部 cdf_len, 下方逻辑零改动。
-    const int cdf_len = (int)cdf_table.size();
-    if (n == 0) return 0.0;
+                 std::span<const double> cdf_table, KSLocation* max_location = nullptr) {
+    if (max_location) *max_location = {};
+    if (n <= 0 || cdf_table.empty()) return 0.0;
     // 防御性 clamp: freq 数组容量 260,max_pity 必须 < 260 否则越界读
     if (max_pity > 259) max_pity = 259;
     // v0.1.2.2: 找到 CDF 表的"有效末端" last_valid (饱和到 1 或单调性破坏前的最后一格).
     // 越过 last_valid 后, 用 cdf[last_valid] 而非 1.0 作 fallback —— 这对辉光池
     // (cdf 在 X=240 处 ≈ 0.93, X>240 时 CDF 仍未达 1) 很关键; 旧代码用 1.0 fallback
     // 会让长尾区域的 K-S 偏离凭空变大.
-    constexpr double EPS_SAT = 1e-6;
-    int last_valid = cdf_len - 1;
-    for (int k = 1; k < cdf_len; ++k) {
-        if (cdf_table[k] >= 1.0 - EPS_SAT) { last_valid = k; break; }
-        if (k > 0 && cdf_table[k] + EPS_SAT < cdf_table[k - 1]) { last_valid = k - 1; break; }
-    }
+    const int last_valid = FindCDFLastValid(cdf_table);
     auto lookup_cdf = [&](int idx) -> double {
         if (idx < 0) return 0.0;
-        if (idx >= cdf_len) return cdf_table[last_valid];
+        if (idx > last_valid) return cdf_table[last_valid];
         return cdf_table[idx];
     };
     double max_d = 0.0;
@@ -1027,8 +1041,14 @@ double ComputeKS(const std::array<int, 260>& freq, int max_pity, int n,
 
         double d1 = std::abs(fn_before - cdf_before_x);
         double d2 = std::abs(fn_after  - cdf_after_x);
-        if (d1 > max_d) max_d = d1;
-        if (d2 > max_d) max_d = d2;
+        if (d1 > max_d) {
+            max_d = d1;
+            if (max_location) *max_location = {x - 1, fn_before, cdf_before_x};
+        }
+        if (d2 > max_d) {
+            max_d = d2;
+            if (max_location) *max_location = {x, fn_after, cdf_after_x};
+        }
     }
     return max_d;
 }
@@ -1332,6 +1352,20 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     StatsResult s;
     s.freq_all  = acc.freq_all;
     s.freq_up   = acc.freq_up;
+    int max_ecdf_up = acc.max_pity_up;
+    if (isWeapon) {
+        // 武器 UP 理论 CDF 只在十连申领边界跳变, 经验 ECDF 和 KS 必须同步聚合。
+        // 只生成这一份聚合频数并导出给图表; 原始单抽频数仍用于 avg / hazard / MRL。
+        for (int x = 1; x <= acc.max_pity_up; ++x) {
+            int slot = ((x + 9) / 10) * 10;
+            if (slot > 259) slot = 259;
+            s.freq_ecdf_up[slot] += acc.freq_up[x];
+        }
+        max_ecdf_up = ((acc.max_pity_up + 9) / 10) * 10;
+        if (max_ecdf_up > 259) max_ecdf_up = 259;
+    } else {
+        s.freq_ecdf_up = acc.freq_up;
+    }
     s.count_all = acc.count_all;
     s.count_up  = acc.count_up;
     s.win_5050  = acc.win_5050;
@@ -1357,7 +1391,7 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
             : (isRefactor ? std::span<const double>(g_cdf_refactor)   // 82
                           : std::span<const double>(g_cdf_char));     // 82
         s.ks_d_all = ComputeKS(acc.freq_all, acc.max_pity_all, acc.count_all,
-                               cdf_tbl);
+                               cdf_tbl, &s.ks_location_all);
         s.ks_is_normal = (s.ks_d_all <= (1.36 / std::sqrt((double)acc.count_all)));
     }
 
@@ -1409,30 +1443,8 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         // 这不需要等到复刻才会发生 —— 首期追潜多抽一个 UP 就会遇到。
         // 故这里只标记, 由输出层把判定改成"样本混合"; D 值仍照常算出供参考。
         s.ks_up_mixed = (isRefactor && acc.count_up > 1);
-        if (isWeapon) {
-            // v0.1.3.3 武器 UP K-S: 先把经验 freq_up 按申领 (10 抽) 粒度向上聚合再比较。
-            // 原因: g_cdf_wep_up 的质量只在 10 倍数边界记账 (申领内平坦, 机制如此),
-            // 而经验 pity_up 记录的是申领内具体单抽落点 (自然出货 ~截断几何分布,
-            // 40/80 保底强制出货的拨内落点游戏未公开)。两条阶梯粒度不同, 逐抽比较会被
-            // "拨内错位"系统性抬高 D (落点均匀假设下渐近 ~0.37, 12 期样本伪拒绝率 ~63%)。
-            // 聚合到申领边界后, 任何拨内落点都映射到同一申领, K-S 对落点假设免疫,
-            // 伪拒绝率回到 <= 名义 5% (模拟: ~2%)。
-            // 仅 K-S 内部用聚合副本; ECDF/MRL 图与 avg_up 仍为单抽粒度, 曲线连贯不变。
-            std::array<int, 260> freq_up_claim{};
-            for (int x = 1; x <= acc.max_pity_up; ++x) {
-                if (acc.freq_up[x] == 0) continue;
-                int slot = ((x + 9) / 10) * 10;   // 向上取整到申领末抽
-                if (slot > 259) slot = 259;       // 防御 (正常数据 pity_up <= 80)
-                freq_up_claim[slot] += acc.freq_up[x];
-            }
-            int max_claim = ((acc.max_pity_up + 9) / 10) * 10;
-            if (max_claim > 259) max_claim = 259;
-            s.ks_d_up = ComputeKS(freq_up_claim, max_claim, acc.count_up,
-                                  cdf_up_tbl);
-        } else {
-            s.ks_d_up = ComputeKS(acc.freq_up, acc.max_pity_up, acc.count_up,
-                                  cdf_up_tbl);
-        }
+        s.ks_d_up = ComputeKS(s.freq_ecdf_up, max_ecdf_up, acc.count_up,
+                              cdf_up_tbl, &s.ks_location_up);
         s.ks_is_normal_up = (s.ks_d_up <= (1.36 / std::sqrt((double)acc.count_up)));
     }
 
@@ -1984,13 +1996,20 @@ void ProcessFile_Consume(HWND hwnd, ProcessOutput* out) {
 //   ECDF 是离散数据的标准非参数显示,无任何参数选择,与 KS 检验直接对应。
 // ---------------------------------------------------------
 void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
-              const std::array<int, 260>& freq_all, const std::array<int, 260>& freq_up,
-              int count_all, int count_up,
-              [[maybe_unused]] int censored_all, [[maybe_unused]] int censored_up,
+              const StatsResult& stats,
               std::span<const double> theory_cdf_all,
               std::span<const double> theory_cdf_up,
               const std::wstring& title, int limit_base,
               int ecdf_up_step_size = 1) {
+    const auto& freq_all = stats.freq_all;
+    // 与文字 KS 共用后端准备的频数；武器 UP 已按十连申领聚合。
+    // MRL 仍从原始 freq_up 读取单抽间隔。
+    const auto& freq_up = stats.freq_ecdf_up;
+    const int count_all = stats.count_all, count_up = stats.count_up;
+    const wchar_t* upNote = stats.ks_up_mixed
+        ? L"UP 样本混合，不作 KS 判定\n理论仅适用于系列内首个 UP"
+        : (ecdf_up_step_size > 1 ? L"UP 按十连申领聚合统计" : nullptr);
+    const float noteHeight = DPIScaleF(stats.ks_up_mixed ? 32.0f : (upNote ? 18.0f : 0.0f));
     Gdiplus::SolidBrush bgBrush(Gdiplus::Color(255, 252, 253, 255));
     g.FillRectangle(&bgBrush, rect);
     Gdiplus::FontFamily fontFamily(L"Microsoft YaHei");
@@ -2022,10 +2041,18 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     Gdiplus::Pen gridPen(Gdiplus::Color(255, 230, 230, 230), DPIScaleF(1.0f));
     Gdiplus::Pen axisPen(Gdiplus::Color(255, 80, 80, 80),  DPIScaleF(1.0f));
     float plotX = (float)rect.X + DPIScaleF(50.0f);
-    float plotY = (float)rect.Y + DPIScaleF(40.0f);
+    float plotY = (float)rect.Y + DPIScaleF(40.0f) + noteHeight;
     float plotW = (float)rect.Width  - DPIScaleF(70.0f);
-    float plotH = (float)rect.Height - DPIScaleF(60.0f);
+    float plotH = (float)rect.Height - DPIScaleF(60.0f) - noteHeight;
     if (plotW <= 0 || plotH <= 0) return;
+
+    if (upNote) {
+        Gdiplus::Font noteFont(&fontFamily, DPIScaleF(11.0f), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+        Gdiplus::SolidBrush noteBrush(Gdiplus::Color(255, 120, 120, 120));
+        g.DrawString(upNote, -1, &noteFont,
+                     Gdiplus::PointF((float)rect.X + DPIScaleF(15.0f),
+                                     (float)rect.Y + DPIScaleF(36.0f)), &noteBrush);
+    }
 
     g.DrawLine(&axisPen, plotX, plotY,         plotX, plotY + plotH);
     g.DrawLine(&axisPen, plotX, plotY + plotH, plotX + plotW, plotY + plotH);
@@ -2097,21 +2124,8 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         Gdiplus::REAL dash[2] = { DPIScaleF(4.0f), DPIScaleF(3.0f) };
         pen.SetDashPattern(dash, 2);
         pen.SetLineJoin(Gdiplus::LineJoinRound);
-        int upper = (cdf_len - 1 < max_x) ? cdf_len - 1 : max_x;
-        if (upper < 1) return;
-        // v0.1.2.2: 截掉两类"伪末端":
-        //   1) 已饱和段: 找到第一个 cdf[k] >= 1-eps 的 k_sat, 之后所有 cdf 都等于 1.0
-        //      (硬保底之后的延伸 + char_up 122 个槽里 cdf[120]=cdf[121]=1 的哨兵区);
-        //      画到 k_sat 就停, 否则末端会冒出一段 1→1 水平虚线 (即"垂直阶梯顶端向右
-        //      拐弯"的视觉 bug, 由 step mode 退出时画的水平退出线引起).
-        //   2) 未填充哨兵段: 辉光庆典 cdf[241]=0 (没设哨兵), 画上去会从 0.93 跳到 0,
-        //      产生倒挂. 检测到 cdf[k] < cdf[k-1] (单调性破坏) 也立即停.
-        constexpr double EPS_SAT = 1e-6;
-        int upper_eff = upper;
-        for (int k = 1; k <= upper; ++k) {
-            if (cdf[k] >= 1.0 - EPS_SAT) { upper_eff = k; break; }
-            if (cdf[k] + EPS_SAT < cdf[k - 1]) { upper_eff = k - 1; break; }
-        }
+        // 与 KS / MRL 共用有效末端，排除饱和段和未填充哨兵段。
+        const int upper_eff = (std::min)(FindCDFLastValid(cdf), max_x);
         if (upper_eff < 1) return;
         Gdiplus::GraphicsPath path;
         auto p0 = getPt(0, cdf[0]);
@@ -2207,51 +2221,34 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     // 标签布局策略:
     //   - 蓝色 (综合): 标签贴在 KS 虚线的左上方 (anchor 右下)
     //   - 红色 (UP):   标签贴在 KS 虚线的右下方 (anchor 左上)
-    //   两个标签天然不会撞在一起, 颜色与对应 ECDF 实线一致, 用户能看出
+    //   标签优先放在标记两侧, 再限制到绘图区内; 颜色与对应 ECDF 实线一致, 用户能看出
     //   "蓝色 KS 标签 → 测的是综合 ECDF 的偏离"。
     //
     // 标签自带白色描边 (4 偏移方向先画白色底字再叠主文本), 在彩色实线上的可读性更好。
     enum class KSLabelAnchor { LeftTop, RightBottom };
-    auto drawKSMarker = [&](const std::array<int, 260>& freq, int total,
+    auto drawKSMarker = [&](const KSLocation& location, double d,
                             std::span<const double> cdf,
                             BYTE r, BYTE gC, BYTE b,
                             KSLabelAnchor anchor) {
-        const int cdf_len = (int)cdf.size();   // v0.1.3.3: span 自带长度
-        if (total == 0 || cdf_len < 2) return;
-        // v0.1.2.4: 同 drawTheoryCDF / computeTheoryMRL, 加 upper_eff 截断避免:
-        //   - 辉光池 cdf[241]=0 (未填充哨兵段) 让 |cum - 0| ≈ 1, 误判为最大偏离点
-        //   - 饱和段 (cdf[k]==1 after hard pity) 上做无意义的比较
-        // 注: 此截断在 v0.1.2.2 已加到 drawTheoryCDF 和 computeTheoryMRL, 但当时漏掉
-        // drawKSMarker, 直到 v0.1.2.4 才补齐.
-        constexpr double EPS_SAT = 1e-6;
-        int upper_scan = (cdf_len - 1 < max_x) ? cdf_len - 1 : max_x;
-        int upper_eff = upper_scan;
-        for (int k = 1; k <= upper_scan; ++k) {
-            if (cdf[k] >= 1.0 - EPS_SAT) { upper_eff = k; break; }
-            if (cdf[k] + EPS_SAT < cdf[k - 1]) { upper_eff = k - 1; break; }
-        }
+        if (d <= 0.01 || location.x <= 0 || location.x > max_x) return;
+        const int upper_eff = (std::min)(FindCDFLastValid(cdf), max_x);
         if (upper_eff < 1) return;
-        double max_d = 0; int max_d_x = 0;
-        double cum = 0;
-        for (int k = 1; k <= upper_eff; ++k) {
-            cum += (double)freq[k] / (double)total;
-            double d = std::fabs(cum - cdf[k]);
-            if (d > max_d) { max_d = d; max_d_x = k; }
+        // D 和坐标均来自统计核心, 不再在图上用另一套范围重新计算。
+        // 辉光的最大点可能在理论曲线之外; 保留 D, 但不连接到未绘制的理论尾部。
+        const bool outsideTheory = location.x > upper_eff;
+        auto p_emp = getPt(location.x, location.empirical);
+        auto p_th  = getPt(location.x, location.theory);
+        if (!outsideTheory) {
+            Gdiplus::Pen ksPen(Gdiplus::Color(255, r, gC, b), DPIScaleF(1.5f));
+            Gdiplus::REAL dash[2] = { DPIScaleF(2.0f), DPIScaleF(2.0f) };
+            ksPen.SetDashPattern(dash, 2);
+            g.DrawLine(&ksPen, p_emp.X, p_emp.Y, p_th.X, p_th.Y);
         }
-        if (max_d <= 0.01 || max_d_x <= 0) return;
-        double emp_y = 0;
-        for (int k = 1; k <= max_d_x; ++k) emp_y += (double)freq[k] / (double)total;
-        double th_y = cdf[max_d_x];
-        auto p_emp = getPt(max_d_x, emp_y);
-        auto p_th  = getPt(max_d_x, th_y);
-        Gdiplus::Pen ksPen(Gdiplus::Color(255, r, gC, b), DPIScaleF(1.5f));
-        Gdiplus::REAL dash[2] = { DPIScaleF(2.0f), DPIScaleF(2.0f) };
-        ksPen.SetDashPattern(dash, 2);
-        g.DrawLine(&ksPen, p_emp.X, p_emp.Y, p_th.X, p_th.Y);
 
-        wchar_t lbl[32];
-        swprintf(lbl, 32, L"KS D=%.3f", max_d);
-        float midY = (p_emp.Y + p_th.Y) * 0.5f;
+        wchar_t lbl[96];
+        swprintf(lbl, 96, L"KS D=%.3f%ls", d,
+                 outsideTheory ? L" (尾部截断参考)" : L"");
+        float midY = outsideTheory ? p_emp.Y : (p_emp.Y + p_th.Y) * 0.5f;
 
         // 测量文字宽度,根据 anchor 计算左上角坐标
         Gdiplus::RectF box;
@@ -2268,6 +2265,10 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
             ty = midY + DPIScaleF(2.0f);
         }
 
+        // 首抽或量程末端取得最大差时, 完整标签也须留在绘图区内。
+        tx = (std::max)(plotX, (std::min)(plotX + plotW - box.Width, tx));
+        ty = (std::max)(plotY, (std::min)(plotY + plotH - box.Height, ty));
+
         // 白色描边
         Gdiplus::SolidBrush whiteBr(Gdiplus::Color(255, 252, 253, 255));
         for (int dx = -1; dx <= 1; dx += 2) {
@@ -2282,11 +2283,13 @@ void DrawECDF(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         g.DrawString(lbl, -1, &tickFont, Gdiplus::PointF(tx, ty), &mainBr);
     };
     // 蓝色 (综合): 左上
-    drawKSMarker(freq_all, count_all, theory_cdf_all,
+    drawKSMarker(stats.ks_location_all, stats.ks_d_all, theory_cdf_all,
                  65, 140, 240, KSLabelAnchor::LeftTop);
     // 红色 (UP): 右下
-    drawKSMarker(freq_up, count_up, theory_cdf_up,
-                 240, 80, 80, KSLabelAnchor::RightBottom);
+    if (!stats.ks_up_mixed) {
+        drawKSMarker(stats.ks_location_up, stats.ks_d_up, theory_cdf_up,
+                     240, 80, 80, KSLabelAnchor::RightBottom);
+    }
 
     // 图例 (3 项水平排列: 综合实线 / UP 实线 / 理论 CDF 虚线)
     // 与 macOS / iOS 端布局对齐 —— 标题旁同一行,从右向左排,
@@ -2451,16 +2454,8 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         std::array<double, 260> tmrl{}; tmrl.fill(-1.0);
         const int cdf_len = (int)cdf.size();   // v0.1.3.3: span 自带长度
         if (cdf_len < 2) return tmrl;
-        int upper = cdf_len - 1;  // CDF 最大有效索引
-        // v0.1.2.2: 与 drawTheoryCDF 同样的 upper_eff 截断逻辑, 避免:
-        //   1) 饱和段 (cdf[k]==1 after hard pity): 不必再算
-        //   2) 未填充末端 (辉光池 cdf[241]=0 删哨兵后): 算 pdf[k]=cdf[k]-cdf[k-1] 会出负值
-        constexpr double EPS_SAT = 1e-6;
-        int upper_eff = upper;
-        for (int k = 1; k <= upper; ++k) {
-            if (cdf[k] >= 1.0 - EPS_SAT) { upper_eff = k; break; }
-            if (cdf[k] + EPS_SAT < cdf[k - 1]) { upper_eff = k - 1; break; }
-        }
+        // 与 KS / ECDF 统一有效末端, 不将未填充槽位当作负的概率质量。
+        const int upper_eff = FindCDFLastValid(cdf);
         if (upper_eff < 1) return tmrl;
         // 长尾点质量参数 (v0.1.2.4):
         //   tail_mass     = 1 - cdf[upper_eff]
@@ -2981,9 +2976,7 @@ void RebuildChartCache(HWND hwnd) {
         // 角色 ECDF: X 轴覆盖 UP 硬保底 120 (UP 分布延伸到此)
         // v0.1.1 起新增 UP 理论 CDF (g_cdf_char_up): 双状态前向迭代算法
         DrawECDF  (g, Gdiplus::Rect(L.chartX1, L.RowY(0), L.chartW, L.chartRowH),
-                   statsChar.freq_all, statsChar.freq_up,
-                   statsChar.count_all, statsChar.count_up,
-                   statsChar.censored_pity_all, statsChar.censored_pity_up,
+                   statsChar,
                    g_cdf_char, g_cdf_char_up,
                    L"角色 (特许寻访) 累积分布 (ECDF)", 120,
                    /*ecdf_up_step_size=*/1);
@@ -3014,9 +3007,7 @@ void RebuildChartCache(HWND hwnd) {
         //   ~7% 长尾质量用单点近似补回, 让 MRL[0] 从无延伸的 ~82 修正回真值 ~104.68.
         //   drawTheoryCDF 仍画到数组末端 (cdf[240]≈0.93), ECDF 视觉上诚实显示截断.
         DrawECDF  (g, Gdiplus::Rect(L.chartX1, L.RowY(1), L.chartW, L.chartRowH),
-                   statsJoint.freq_all, statsJoint.freq_up,
-                   statsJoint.count_all, statsJoint.count_up,
-                   statsJoint.censored_pity_all, statsJoint.censored_pity_up,
+                   statsJoint,
                    g_cdf_char, g_cdf_joint_up,
                    L"角色 (辉光庆典) 累积分布 (ECDF)", 240,
                    /*ecdf_up_step_size=*/1);
@@ -3040,9 +3031,7 @@ void RebuildChartCache(HWND hwnd) {
         //   赠送十连让两个期望都略微下降。
         // X 轴与特许池一致取 120 (UP 硬保底), MRL 的理论上限同为 80 / 120。
         DrawECDF  (g, Gdiplus::Rect(L.chartX1, L.RowY(2), L.chartW, L.chartRowH),
-                   statsRefactor.freq_all, statsRefactor.freq_up,
-                   statsRefactor.count_all, statsRefactor.count_up,
-                   statsRefactor.censored_pity_all, statsRefactor.censored_pity_up,
+                   statsRefactor,
                    g_cdf_refactor, g_cdf_refactor_up,
                    L"角色 (重构寻访) 累积分布 (ECDF)", 120,
                    /*ecdf_up_step_size=*/1);
@@ -3059,9 +3048,7 @@ void RebuildChartCache(HWND hwnd) {
         // v0.1.1 起新增 UP 理论 CDF (g_cdf_wep_up): 4×8 状态机
         // ECDF 用真阶梯 (拨内 CDF 平坦, 10 倍数处跳跃) 体现"10 抽一组"机制
         DrawECDF  (g, Gdiplus::Rect(L.chartX1, L.RowY(3), L.chartW, L.chartRowH),
-                   statsWep.freq_all, statsWep.freq_up,
-                   statsWep.count_all, statsWep.count_up,
-                   statsWep.censored_pity_all, statsWep.censored_pity_up,
+                   statsWep,
                    g_cdf_wep, g_cdf_wep_up,
                    L"武器累积分布 (ECDF)", 80,
                    /*ecdf_up_step_size=*/10);
