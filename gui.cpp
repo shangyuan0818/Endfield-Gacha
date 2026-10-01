@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <memory>      // std::make_unique_for_overwrite (C++20) —— worker 的 2MB PMR arena 用它在堆上不清零分配
 #include <process.h>   // _beginthreadex / _endthreadex(调用 CRT 的线程应走这个而非裸 CreateThread)
+#include "JsonScan.h"
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -102,80 +103,27 @@ inline GachaType ParseGachaType(std::string_view sv) {
 }
 
 // ---------------------------------------------------------
-// [极简 JSON 模块 - 修复转义边界]
+// [共享 JSON 扫描器 - 按结构读取 UIGF 存档]
 // ---------------------------------------------------------
-inline size_t FindJsonKey(std::string_view source, std::string_view key, size_t startPos = 0) {
-    while (true) {
-        size_t pos = source.find(key, startPos);
-        if (pos == std::string_view::npos) return std::string_view::npos;
-        if (pos > 0 && source[pos - 1] == '"' &&
-            (pos + key.length() < source.length()) &&
-            source[pos + key.length()] == '"') return pos - 1;
-        startPos = pos + key.length();
-    }
-}
-
 inline std::string_view ExtractJsonValue(std::string_view source, std::string_view key, bool isString) {
-    size_t pos = FindJsonKey(source, key);
-    if (pos == std::string_view::npos) return {};
-    pos = source.find(':', pos + key.length() + 2);
-    if (pos == std::string_view::npos) return {};
-    ++pos;
-    while (pos < source.length() &&
-           (source[pos] == ' ' || source[pos] == '\t' ||
-            source[pos] == '\n' || source[pos] == '\r')) ++pos;
-
-    if (isString) {
-        if (pos >= source.length() || source[pos] != '"') return {};
-        ++pos;
-        size_t endPos = pos;
-        while (endPos < source.length() && source[endPos] != '"') {
-            if (source[endPos] == '\\' && endPos + 1 < source.length()) endPos += 2;
-            else ++endPos;
-        }
-        return (endPos < source.length()) ? source.substr(pos, endPos - pos) : std::string_view{};
-    } else {
-        size_t endPos = pos;
-        // 注意:原版 gui.cpp 少了 ']' 判断(main.cpp 有),这里补齐以保证解析嵌套数组值时不出错
-        while (endPos < source.length() &&
-               source[endPos] != ',' && source[endPos] != '}' &&
-               source[endPos] != ']' && source[endPos] != ' ' &&
-               source[endPos] != '\n' && source[endPos] != '\r') ++endPos;
-        return source.substr(pos, endPos - pos);
-    }
+    return efjson::ExtractValue(source, key, isString);
 }
 
 template<typename Callback>
-void ForEachJsonObject(std::string_view source, std::string_view arrayKey, Callback&& cb) {
-    size_t pos = FindJsonKey(source, arrayKey);
-    if (pos == std::string_view::npos) return;
-    pos = source.find(':', pos + arrayKey.length() + 2);
-    if (pos == std::string_view::npos) return;
-    pos = source.find('[', pos);
-    if (pos == std::string_view::npos) return;
-
-    int depth = 0;
-    size_t objStart = 0;
-    const size_t len = source.length();
-    for (size_t i = pos; i < len; ++i) {
-        char c = source[i];
-        if (c == '"') {
-            for (++i; i < len; ++i) {
-                if (source[i] == '\\' && i + 1 < len) { ++i; continue; }
-                if (source[i] == '"') break;
-            }
-            continue;
-        }
-        if (c == '{') {
-            if (depth == 0) objStart = i;
-            ++depth;
-        } else if (c == '}') {
-            --depth;
-            if (depth == 0) cb(source.substr(objStart, i - objStart + 1));
-        } else if (c == ']' && depth == 0) {
-            break;
-        }
+[[nodiscard]] efjson::ArrayScan ReadUigfPullList(std::string_view document, Callback&& cb) {
+    // 本层定位根.endfield[0].list, 避免误读 non_pull_events[].raw 里的 list。
+    const auto game = efjson::FindMember(document, "endfield");
+    if (game.kind == efjson::ValueKind::Array) {
+        const auto account = efjson::FirstElement(game.text);
+        if (account.kind != efjson::ValueKind::Object) return efjson::ArrayScan::Malformed;
+        const auto list = efjson::FindMember(account.text, "list");
+        if (list.kind != efjson::ValueKind::Array) return efjson::ArrayScan::Malformed;
+        return efjson::ForEachObjectIn(list.text, std::forward<Callback>(cb));
     }
+    // 键存在但类型异常/结构损坏时中止, 不能再从事件原文里找一份替代数组。
+    if (game.kind != efjson::ValueKind::None || game.malformed) return efjson::ArrayScan::Malformed;
+    // 完全没有 endfield 段的旧格式/第三方文件保留原来的 list 回退路径。
+    return efjson::ForEachObjectByKey(document, "list", std::forward<Callback>(cb));
 }
 
 struct StringHash {
@@ -1153,12 +1101,12 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     int current_pity = 0, pity_since_last_up = 0;
     // 卡池边界重置策略 (终末地三池各不同 —— 联网核实 + uigf 数据验证):
     //   - 特许池(Special): 仅 120 硬保底每期重置 (pity_since_last_up); 80 小保底【继承】(current_pity 不重置)
-    //   - 武器池(Weapon):  40 小保底 + 80 硬保底【都】每期重置 (current_pity 与 pity_since_last_up 都重置, 均不继承)
+    //   - 武器池(Weapon):  40 小保底 + 80 硬保底按 pool_name 各存一份, 交错记录不会清掉另一池的进度
     //   - 辉光庆典(Joint): 无硬保底, 连续累加, 不按期重置
     //   got_up_banner: 本期是否已出过 UP/限定 (硬保底每期仅生效一次), 每期重置
     //   hardpity_n:    硬保底强制阈值 —— 角色 120 抽; 武器 8 申领(= 第 71..80 抽强制出限定)
-    // 三池均无“歪→下次必中”那种保底; 边界用 poolName 变化探测 (数据里每期 pool_name 唯一;
-    //   武器 id 为负, 桶内按 |id| 升序 = 时间序, 每期连续).
+    // 三池均无“歪→下次必中”那种保底; 特许角色仍用相邻 poolName 变化探测换期。
+    // 武器 id 为负, 桶内按 |id| 升序 = 时间序, 同时开放的武器池记录可能交错。
     bool got_up_banner = false;
     // 重构寻访: 80 小保底跨所有重构池共享继承, 120 UP 保底按【同名系列】一生一次,
     //   两者都不按期重置 → 与 Joint 一样 track_banner = false;
@@ -1194,12 +1142,15 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     //   依次经历 A 第一期 → B 第一期 → A 第二期就会发生。
     //   系列标识用 pool_name: 同名系列的 #1/#2/#3 共用一个 pool_name, 不同系列名字不同。
     struct SeriesState {
+        int  pity_all   = 0;      // 武器池独立六星水位; 重构角色的小保底仍由 current_pity 共享
         int  pity_up    = 0;      // 距该系列上一个 UP 的抽数 (即 120 兜底的计数)
         int  free_count = 0;      // 该系列已用掉的赠送十连条数 (决定 30/60/90 节点)
         bool got_up     = false;  // 该系列的 120 兜底额度是否已被本体抽消耗
     };
     std::unordered_map<std::string_view, SeriesState> series_states;
     SeriesState* last_series = nullptr;   // 收尾算右删失时用最后活动的那个系列
+    // 武器记录共用一条时间线, 来回切换武库/重构申领时各池状态必须保留。
+    const bool keyed_up = (isRefactor || track_weapon);
 
     // 第30抽赠送十连处理 (依据《明日方舟终末地抽卡机制解析》2.1.1):
     //   - "该十连享有基础概率(0.008),但不占用也不增加保底进度"
@@ -1213,17 +1164,18 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
     for (size_t i = 0; i < total; ++i) {
         const bool isFree = bucket.is_free[i];
 
-        // 重构池: 按 pool_name 取出该系列自己的状态 (不存在则默认构造 = 全新系列)。
+        // 重构角色/武器池: 按 pool_name 取出自己的状态 (不存在则默认构造)。
         //   unordered_map 是节点式容器, 插入新键不会让已取得的引用失效。
-        //   非重构池仍用函数级的单份状态, 行为与既有版本完全一致。
+        //   特许/辉光角色仍用函数级的单份状态。
         SeriesState* ss = nullptr;
-        if (isRefactor) {
+        if (keyed_up) {
             ss = &series_states[bucket.poolNames[i]];
             last_series = ss;
         }
-        int&  up_pity   = isRefactor ? ss->pity_up    : pity_since_last_up;
-        bool& up_gotten = isRefactor ? ss->got_up     : got_up_banner;
-        int&  free_cnt  = isRefactor ? ss->free_count : free_pull_count;
+        int&  pity_all  = track_weapon ? ss->pity_all : current_pity;
+        int&  up_pity   = keyed_up ? ss->pity_up    : pity_since_last_up;
+        bool& up_gotten = keyed_up ? ss->got_up     : got_up_banner;
+        int&  free_cnt  = keyed_up ? ss->free_count : free_pull_count;
 
         // 本条若是赠送十连, 先算出它属于第几块 (1-based), 再累加计数
         int free_block_idx = 0;
@@ -1232,19 +1184,16 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
         // 卡池边界探测: 读分桶阶段预计算的字节标记 (v0.1.3.2), 不再在热路径 memcmp 池名。
         //   starts_new_banner[i] = (本条 poolName 与上一条不同); 首条恒为 0 → 已含原 i>0 守卫。
         //   特许池: 120 硬保底不继承 → pity_since_last_up + got_up_banner 清零; 80 小保底继承 (current_pity 不动)
-        //   武器池: 40 + 80 都不继承 → current_pity + pity_since_last_up + got_up_banner 全清零
-        // 重构池【不】走这里: 它的 UP 侧状态按系列存在 series_states 里, 换池只是换一份
-        //   状态, 不需要清零; current_pity 则跨所有重构池共享, 更不能清。
-        //   这样两个系列即使记录交错 (将来两个重构系列同时开放), 各自的计数也互不干扰。
-        if (track_banner && bucket.starts_new_banner[i]) {
+        // 武器池/重构角色的 UP 状态已按键保存, 切池只换状态, 不再清零。
+        // 重构角色的 current_pity 仍跨所有重构池共享。
+        if (track_special && bucket.starts_new_banner[i]) {
             pity_since_last_up = 0;
             got_up_banner      = false;
-            if (track_weapon) current_pity = 0;   // 武器 40 小保底也每期重算 (角色 80 小保底继承, 不清)
         }
 
         // 赠送十连不推进保底通道
         if (!isFree) {
-            ++current_pity;
+            ++pity_all;
             ++up_pity;
         }
 
@@ -1269,7 +1218,7 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
             free_node_all = 60;
             free_node_up  = (free_block_idx == 2) ? 60 : 90;
         }
-        const int slot_all = isFree ? free_node_all : current_pity;
+        const int slot_all = isFree ? free_node_all : pity_all;
         if (slot_all < 260) acc.freq_all[slot_all]++;
         if (slot_all > acc.max_pity_all) acc.max_pity_all = slot_all;
         acc.count_all++;
@@ -1330,17 +1279,15 @@ StatsResult Calculate(const PullBucket& bucket, bool isWeapon,
             // 非 UP/非限定六星 = 一次独立判定的“负”。终末地可连续歪多次, 全部如实计入。
             acc.lose_5050++;
         }
-        // 赠送十连出货不重置 current_pity (独立通道); 正常出货重置
-        if (!isFree) current_pity = 0;
+        // 赠送十连出货不重置综合水位 (独立通道); 正常出货重置
+        if (!isFree) pity_all = 0;
     }
 
     // 右删失:遍历结束时若仍有未结算的 pity,记录为删失样本
     // 这些抽数"存活"到了 current_pity 抽仍未出 6 星(或 UP)
-    acc.censored_pity_all = current_pity;
-    // 右删失的 UP 水位: 重构池取【最后活动的那个系列】的进度 (界面"当前垫刀"关心的是
-    //   玩家正在抽的那期), 其余池型仍用函数级的单份状态。
-    acc.censored_pity_up  = (isRefactor && last_series) ? last_series->pity_up
-                                                        : pity_since_last_up;
+    acc.censored_pity_all = (track_weapon && last_series) ? last_series->pity_all : current_pity;
+    // 按键保存的 UP 水位只展示最后活动的那一份; 重构角色的右删失口径保持不变。
+    acc.censored_pity_up  = (keyed_up && last_series) ? last_series->pity_up : pity_since_last_up;
 
     // 防御性 clamp:即使数据异常导致 max_pity / censored_pity > 249,
     // 后续 ComputeKS 与 hazard 循环的索引访问也必须安全
@@ -1639,18 +1586,18 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
     std::pmr::vector<Temp> temps(alloc);
     temps.reserve(6000);
 
-    ForEachJsonObject(bufferView, "list", [&](std::string_view itemStr) {
+    const auto listScan = ReadUigfPullList(bufferView, [&](std::string_view itemStr) {
         // UIGF v4.2 字段读取:
         //   - gacha_type   (替代 v3.0 的 uigf_gacha_type)
         //   - item_name    (替代 v3.0 的 name)
         //   - pool_name    (自定义,snake_case;原 poolName)
         //   - is_free      (自定义,snake_case;原 isFree)
         //
-        // ForEachJsonObject 找的是 "list" 这个 key。v4.2 文件里 "list" 只
-        // 在 endfield[0] 内层出现一次(顶层 info 块没有 list),所以不需要
-        // 先穿透 endfield 数组,直接找到的就是正确的记录数组。
         ItemType  it = ParseItemType (ExtractJsonValue(itemStr, "item_type",  true));
-        RankType  rt = ParseRankType (ExtractJsonValue(itemStr, "rank_type",  true));
+        // 第三方存档可能将 rank_type 写为数字, 两种标量形态都接受。
+        std::string_view rankStr = ExtractJsonValue(itemStr, "rank_type", true);
+        if (rankStr.empty()) rankStr = ExtractJsonValue(itemStr, "rank_type", false);
+        RankType  rt = ParseRankType(rankStr);
         GachaType gt = ParseGachaType(ExtractJsonValue(itemStr, "gacha_type", true));
 
         // 角色路径: Special (特许寻访) / Joint (辉光庆典) / Refactor (重构寻访) 都进入
@@ -1665,18 +1612,13 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
                          gt != GachaType::Beginner);
         if (!charPath && !wepPath) return;
 
-        // v0.1.4.0 幽灵记录防御:「寻访情报书」(kind = "gift_intel_book") 会混在
-        //   /api/record/char 的 list 里返回 —— 它不是一次寻访, 没有 charId / charName,
-        //   也没有 rarity。新版 main.cpp 已在导出侧滤掉, 但【旧版导出的 uigf_endfield.json
-        //   里可能已经存了这类条目】, 那些记录的 rank_type 是空串 → RankType::Unknown。
-        //   若照单全收, 它们会被当成"一次没出六星的抽卡"而把保底水位多推 1 抽
-        //   (每 60 抽一本, 特许池尤其明显)。稀有度是每条真实抽卡记录必有的字段,
-        //   所以这里用 rank_type 解析失败作为判据, 安全且不会误删真实记录。
-        //   上游同类工具的判据是 kind != "gift_intel_book" (bhaoo/endfield-gacha #44 等)。
-        if (rt == RankType::Unknown) return;
+        // 旧存档可能混入寻访情报书等非抽卡事件。只有没有物品 id 且稀有度无法识别
+        // 才丢弃; 缺稀有度但带 item_id 的真实记录仍应推进水位。
+        if (rt == RankType::Unknown && ExtractJsonValue(itemStr, "item_id", true).empty()) return;
 
         std::string_view name = ExtractJsonValue(itemStr, "item_name", true);
         std::string_view poolName = ExtractJsonValue(itemStr, "pool_name", true);
+        if (poolName.empty()) poolName = ExtractJsonValue(itemStr, "gacha_type", true);
 
         std::string_view idStr = ExtractJsonValue(itemStr, "id", true);
         if (idStr.empty()) idStr = ExtractJsonValue(itemStr, "id", false);
@@ -1692,9 +1634,17 @@ unsigned __stdcall ProcessFile_Worker(void* arg) {
         temps.push_back(Temp{parsed_id, it, gt, rt, name, poolName, isFree});
     });
 
-    if (temps.empty()) {
+    // 扫描可能已经交付前半段记录, 结构损坏时仍必须中止, 不能分析残缺历史。
+    if (listScan == efjson::ArrayScan::Malformed || temps.empty()) {
         out->ok = false;
-        out->errMsg = L"JSON 解析失败或无数据。";
+        if (listScan == efjson::ArrayScan::Malformed) {
+            out->errMsg = L"存档文件结构损坏或不完整: 抽卡记录数组没有正常闭合, 或含有非对象元素 / 缺少分隔逗号。\n"
+                          L"为避免基于残缺数据给出错误统计, 已停止分析。请检查该文件。";
+        } else {
+            out->errMsg = listScan == efjson::ArrayScan::NotFound
+                ? L"没有在文件里找到抽卡记录数组 (UIGF v4.2 的 endfield[0].list)。"
+                : L"文件里没有可分析的抽卡记录。";
+        }
         // 防御分支: v0.1.3.3 起 WM_DESTROY 会先 join 本线程再销毁窗口, "关窗导致 HWND
         // 失效"已不会发生; PostMessageW 仍可能因极端情况失败 (如线程消息队列满 10000 条)。
         // 失败则没人消费 out → worker 自己清理, 否则泄漏 ProcessOutput + mmap 句柄, 且
@@ -2414,9 +2364,10 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
     for (int i = 1; i < 260; i++) {
         if (freq_all[i] > 0 || freq_up[i] > 0) if (i > max_x) max_x = i;
     }
+    max_x = (std::max)(max_x, (std::max)(censored_all, censored_up));
     // v0.1.2.1: 无出金时不再直接 return, 继续渲染理论 MRL 虚线作参考。
-    // 经验 MRL 自然为空 (computeEmpiricalMRL 内部已防御 total==0), KS / "你在这里" 标记
-    // 也都依赖出金数据, 缺失时跳过。提示在最后叠加灰色字。
+    // 经验 MRL 自然为空 (computeEmpiricalMRL 内部已防御 total==0), 当前垫刀仍可标注。
+    // 无出货提示在最后叠加灰色字。
     max_x = ((max_x / 10) + 1) * 10;
     // v0.1.3.3: 同 DrawECDF 的 259 钳制 —— 此处更严重: computeEmpiricalMRL 内
     // surv[t]/mrl[t] 在 t=260 是【栈数组越界写】(ASan 实测 stack-buffer-overflow),
@@ -2647,18 +2598,22 @@ void DrawMRL(Gdiplus::Graphics& g, Gdiplus::Rect rect,
         if (y_value <= 0 && mrl_data.first[censored] > 0) {
             y_value = mrl_data.first[censored];
         }
-        if (y_value <= 0) return;
         Gdiplus::Color color(255, r, gC, b);
         Gdiplus::Pen markPen(color, DPIScaleF(1.5f));
         // dash pattern 与理论 CDF/MRL 保持一致 (4/3),让所有虚线视觉风格统一
         Gdiplus::REAL dash[2] = { DPIScaleF(4.0f), DPIScaleF(3.0f) };
         markPen.SetDashPattern(dash, 2);
-        auto top = getPt(censored, y_value);
+        // 两种曲线都没有可用 y 值时仍保留整高竖线, 让当前水位始终可见。
+        const auto top = y_value > 0 ? getPt(censored, y_value) : getPt(censored, max_y);
         g.DrawLine(&markPen, top.X, top.Y, top.X, plotY + plotH);
 
         // 收集标签 (新格式: 单行, 用中点分隔; 右上角空间足够)
         wchar_t lbl[64];
-        swprintf(lbl, 64, L"已垫 %d 抽 · 预期还需 %.1f", censored, y_value);
+        if (y_value > 0) {
+            swprintf(lbl, 64, L"已垫 %d 抽 · 预期还需 %.1f", censored, y_value);
+        } else {
+            swprintf(lbl, 64, L"已垫 %d 抽 · 超出理论曲线范围", censored);
+        }
         censoredLabels.push_back({ std::wstring(lbl), color });
     };
     resolveAndDrawLine(censored_all, mrl_all, theory_mrl_all, theory_all_cap, 65, 140, 240);
