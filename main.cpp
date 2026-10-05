@@ -350,16 +350,18 @@ struct NonPullEvent {
 // ---------------------------------------------------------
 // [BufferedWriter - 析构 RAII Flush + 短写/失败检查]
 // ---------------------------------------------------------
-// 时间转换失败返回 -1, 调用方不能读取未初始化的 tm 或写出随机日期。
-inline int FormatLocalTime(long long seconds, char* buf, size_t capacity) {
-    const time_t t = static_cast<time_t>(seconds);
-    if (static_cast<long long>(t) != seconds) return -1;
+// 把 Unix 秒数格式化成 UTC+8 的 "YYYY-MM-DD HH:MM:SS", 返回写出的长度 (无法表示时为 0)。
+// time / export_time 与 "timezone": 8 固定使用 UTC+8 (国服与亚服的服务器时区), 不取导出设备
+// 的本地时区: 同一条记录在任何设备、任何季节写出的字符串都相同, 不受夏令时影响,
+// 也始终与 timezone 字段对得上。Apple 端的同名函数是同一套写法。
+inline int FormatUtc8Time(long long seconds, char* buf, size_t capacity) {
+    const time_t t = static_cast<time_t>(seconds + 8 * 3600);
     struct tm value{};
-    if (localtime_s(&value, &t) != 0) return -1;
+    if (gmtime_s(&value, &t) != 0) return 0;
     const int len = std::snprintf(buf, capacity, "%04d-%02d-%02d %02d:%02d:%02d",
                                   value.tm_year + 1900, value.tm_mon + 1, value.tm_mday,
                                   value.tm_hour, value.tm_min, value.tm_sec);
-    return len >= 0 && static_cast<size_t>(len) < capacity ? len : -1;
+    return len < 0 ? 0 : len;
 }
 
 struct BufferedWriter {
@@ -436,8 +438,7 @@ struct BufferedWriter {
 
     void WriteTimeKV(std::string_view key, long long ms_ts) {
         char tbuf[64];
-        int len = FormatLocalTime(ms_ts / 1000, tbuf, sizeof(tbuf));
-        if (len < 0) len = 0;   // 无法表示的时间写成空串, 不因此让整次写盘失败 (与 Apple 端一致)
+        const int len = FormatUtc8Time(ms_ts / 1000, tbuf, sizeof(tbuf));
         WriteLit("            \"");
         Write(key);
         WriteLit("\": \"");
@@ -930,8 +931,7 @@ int main() {
 
     time_t rawtime = time(nullptr);
     char exportTime[64];
-    int exportTimeLen = FormatLocalTime(static_cast<long long>(rawtime), exportTime, sizeof(exportTime));
-    if (exportTimeLen < 0) exportTimeLen = 0;   // 转换不了就把 export_time 写成空串, 照常写盘 (与 Apple 端一致)
+    const int exportTimeLen = FormatUtc8Time(static_cast<long long>(rawtime), exportTime, sizeof(exportTime));
     const long long export_ts = static_cast<long long>(rawtime);
     bool exportOk = false;
 
@@ -990,22 +990,10 @@ int main() {
             w.WriteLit("        \"export_time\": \""); w.Write(exportTime, (DWORD)exportTimeLen); w.WriteLit("\"\n    },\n");
 
             // ---- endfield 数组(单账号 → 单元素) ----
-            // timezone 用本地时区偏移(单位:小时)。Windows 上没有 tm_gmtoff,
-            // 用 GetTimeZoneInformation 取偏置(Bias 单位是分钟,且符号约定是
-            // "UTC = local + Bias",所以东 8 区返回 -480,需要取负再除 60)。
-            TIME_ZONE_INFORMATION tzi{};
-            DWORD tzKind = GetTimeZoneInformation(&tzi);
-            LONG biasMinutes = tzi.Bias;   // 取不到时区时 tzi 保持全零, timezone 写 0 (与 Apple 端一致)
-            if (tzKind == TIME_ZONE_ID_DAYLIGHT) biasMinutes += tzi.DaylightBias;
-            else if (tzKind == TIME_ZONE_ID_STANDARD) biasMinutes += tzi.StandardBias;
-            int tzHours = (int)(-biasMinutes / 60);
-
+            // timezone 固定为 8: 文件里所有 time 都按 UTC+8 写出 (见 FormatUtc8Time), 两者一致。
             w.WriteLit("    \"endfield\": [\n        {\n");
             w.WriteLit("            \"uid\": \"0\",\n");
-            w.WriteLit("            \"timezone\": ");
-            auto [tzPtr, tzEc] = std::to_chars(numBuf, numBuf + 32, tzHours);
-            w.Write(numBuf, (DWORD)(tzPtr - numBuf));
-            w.WriteLit(",\n");
+            w.WriteLit("            \"timezone\": 8,\n");
             w.WriteLit("            \"lang\": \"zh-cn\",\n");
             w.WriteLit("            \"list\": [\n");
 
